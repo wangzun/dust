@@ -2,79 +2,51 @@
 name = "dust"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [workspace]
-members = [
-  "crates/*",
-]
+members = ["crates/*"]
 
 [workspace.dependencies]
 dust_vdb = { path = "crates/vdb" }
 dust_vox = { path = "crates/vox" }
 dust_pbr = { path = "crates/pbr" }
 dust_app = { path = "crates/app" }
-dust_denoiser = { path = "crates/denoiser" }
-pumicite = { git = "https://github.com/dust-engine/pumicite.git", rev = "022619cad28e5b053e3740761ea0b0a1bd77af8f" }
-bevy_pumicite = { git = "https://github.com/dust-engine/pumicite.git", rev = "022619cad28e5b053e3740761ea0b0a1bd77af8f" }
-pumicite_egui = { git = "https://github.com/dust-engine/pumicite.git", rev = "022619cad28e5b053e3740761ea0b0a1bd77af8f" }
+pumicite = { path = "/Volumes/t1/code/pumicite" }
+bevy_pumicite = { path = "/Volumes/t1/code/pumicite/crates/bevy" }
 
 [dependencies]
 dust_vox.workspace = true
 dust_pbr.workspace = true
 dust_app.workspace = true
-dust_denoiser.workspace = true
 bevy.workspace = true
 pumicite.workspace = true
 bevy_pumicite.workspace = true
 
 [workspace.dependencies.bevy]
-version = "0.17.0-dev"
+version = "0.18.1"
 default-features = false
 features = [
-    "std",
-    "async_executor",
-    "bevy_winit",
-    "bevy_log",
-    "bevy_window",
-    "bevy_asset",
-    "bevy_scene",
-    "debug",
-    "reflect_auto_register",
-    "multi_threaded",
+  "std",
+  "async_executor",
+  "bevy_winit",
+  "bevy_log",
+  "bevy_window",
+  "bevy_asset",
+  "bevy_scene",
+  "free_camera",
+  "debug",
+  "reflect_auto_register",
+  "multi_threaded",
 ]
 
 [patch.crates-io]
 ash = { git = "https://github.com/0xbeefd1ed/ash.git", branch = "meta" }
-bevy_ecs = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_app = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_window = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_platform = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_utils = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_transform = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_time = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_tasks = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_reflect = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_ptr = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_math = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_log = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_input = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_diagnostic = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_derive = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_winit = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_internal = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_asset = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy_scene = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
-bevy = { git = "https://github.com/dust-engine/bevy", branch = "release-0.17.3"  }
 
 [patch."https://github.com/ash-rs/ash.git"]
-ash = { git = "https://github.com/0xbeefd1ed/ash", branch = "meta" }
+ash = { git = "https://github.com/0xbeefd1ed/ash.git", branch = "meta" }
 
-# If overriding pumicite, use cargo to build the project. Bazel wouldn't support this.
-# [patch."https://github.com/dust-engine/pumicite.git"]
-# pumicite = { path = "../pumicite" }
-# bevy_pumicite = { path = "../pumicite/crates/bevy" }
-# pumicite_egui = { path = "../pumicite/crates/egui" }
+[patch."https://github.com/ash-rs/ash"]
+ash = { git = "https://github.com/0xbeefd1ed/ash.git", branch = "meta" }
 
 [profile.release]
 debug = true

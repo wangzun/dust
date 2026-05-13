@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 dust_vdb.workspace = true
-dust_pbr.workspace = true
 pumicite.workspace = true
 bevy_pumicite.workspace = true
 bevy.workspace = true
@@ -15,5 +14,4 @@ rayon = "1.10"
 tracing = "0.1"
 bitvec = "1"
 bytemuck = "1.23"
-smallvec = "1.15"
 serde = "1"

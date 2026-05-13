@@ -1,18 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use bevy::{
-    asset::{AssetLoader, AsyncReadExt},
-    math::Vec3A,
-    prelude::*,
-};
-use bevy_pumicite::rtx::tlas::TLASInstance;
+use bevy::{asset::AssetLoader, math::Vec3A, prelude::*, reflect::TypePath};
 use dot_vox::{DotVoxData, Rotation, SceneNode};
 use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Tree, VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxModel, VoxModelBundle, VoxPalette, geometry::VoxGeometryLeafStorage
+    VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxModel, VoxModelBundle, VoxPalette,
 };
 
 enum WorldOrParent<'w, 'q> {
@@ -27,16 +22,9 @@ impl<'w, 'q> WorldOrParent<'w, 'q> {
             WorldOrParent::Parent(parent) => parent.spawn(bundle),
         }
     }
-    fn has_parent(&self) -> bool {
-        match self {
-            WorldOrParent::World(_) => false,
-            WorldOrParent::Parent(_) => true,
-        }
-    }
 }
 
 struct SceneGraphTraverser<'a> {
-    unit_size: f32,
     scene: &'a DotVoxData,
     models: BTreeSet<u32>,
     instances: Vec<(u32, Entity)>,
@@ -63,7 +51,6 @@ impl<'a> SceneGraphTraverser<'a> {
                     transform: Transform::default(),
                     global_transform: GlobalTransform::default(),
                     instance: VoxInstance,
-                    tlas_instance: TLASInstance::new(Entity::PLACEHOLDER),
                 })
                 .id();
             self.instances.push((0, entity));
@@ -197,6 +184,7 @@ pub enum VoxLoadingError {
     VulkanError(#[from] vk::Result),
 }
 
+#[derive(TypePath)]
 pub struct VoxLoader {
     allocator: Allocator,
 }
@@ -234,7 +222,7 @@ impl AssetLoader for VoxLoader {
         load_context: &mut bevy::asset::LoadContext,
     ) -> impl bevy::tasks::ConditionalSendFuture<Output = Result<Scene, VoxLoadingError>> {
         async {
-            tracing::info!("Loading vox file {}", load_context.path().display());
+            tracing::info!("Loading vox file {:?}", load_context.path());
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer).await?;
             let mut file = dot_vox::load_bytes(buffer.as_slice())
@@ -243,7 +231,6 @@ impl AssetLoader for VoxLoader {
 
             let mut world = World::default();
             let mut traverser = SceneGraphTraverser {
-                unit_size: settings.unit_size,
                 scene: &file,
                 models: BTreeSet::new(),
                 instances: Vec::new(),
@@ -322,10 +309,10 @@ impl AssetLoader for VoxLoader {
                                 .add_labeled_asset(format!("Material{}", model_id), material);
                             let bundle = VoxModelBundle {
                                 model: VoxModel {
-                                geometry,
-                                material,
-                                palette: palette_handle.clone(),
-                                sbt_index: u32::MAX},
+                                    geometry,
+                                    material,
+                                    palette: palette_handle.clone(),
+                                },
                                 ..Default::default()
                             };
                             bundle
@@ -334,18 +321,7 @@ impl AssetLoader for VoxLoader {
                 BTreeMap::from_iter(referenced_models.into_iter().zip(entities))
             };
 
-            referenced_instances
-                .into_iter()
-                .for_each(|(model_id, entity_id)| {
-                    let model_entity = model_handles.get(&model_id).unwrap();
-
-                    let mut entity = world.entity_mut(entity_id);
-                    entity
-                        .get_mut::<TLASInstance<dust_pbr::PbrInstanceData>>()
-                        .as_mut()
-                        .unwrap()
-                        .blas = *model_entity;
-                });
+            let _ = (model_handles, referenced_instances);
             let scene = bevy::scene::Scene::new(world);
 
             tracing::info!("Scene spawned");

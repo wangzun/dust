@@ -1,7 +1,4 @@
-mod bazel_asset;
-
 use bevy::prelude::*;
-use pumicite::{Allocator, ash::vk, swapchain::SwapchainColorMode, tracking::Access};
 
 #[derive(Resource)]
 pub struct ApplicationSettings {
@@ -19,7 +16,5 @@ pub struct DustApp;
 impl Plugin for DustApp {
     fn build(&self, app: &mut App) {
         app.init_resource::<ApplicationSettings>();
-
-        app.register_asset_source("bazel", bazel_asset::bazel_asset_source());
     }
 }

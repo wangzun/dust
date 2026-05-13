@@ -2,17 +2,13 @@ use std::marker::PhantomData;
 
 use bevy::{asset::Asset, math::UVec3, reflect::TypePath};
 use bitvec::{BitArr, array::BitArray};
-use dust_vdb::{AttributeAllocator, Node};
-use pumicite::{
-    Allocator,
-    ash::vk,
-    buffer::{BufferLike, ManagedBuffer},
-};
+use dust_vdb::AttributeAllocator;
+use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
 
 #[derive(Debug, Clone)]
 pub struct VoxLeafNode {
     /// 10 bits for X, Y, Z.
-    coords: u32,
+    pub coords: u32,
     material_ptr: u32,
 }
 impl Default for VoxLeafNode {

@@ -1,7 +1,0 @@
-ComputePipeline(
-    shader: (
-        path: "bazel://dust/crates/pbr/shaders/tonemap.out",
-        entry_point: "main",
-    ),
-    layout: Path("bazel://dust/crates/pbr/shaders/tonemap.playout.bin"),
-)

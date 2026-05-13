@@ -1,21 +1,14 @@
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
-use crate::{Tree, VoxModel, VoxModelBLASRebuild};
-use bevy::{
-    ecs::system::lifetimeless::{SRes, SResMut},
-    prelude::*,
-};
-use bevy_pumicite::{rtx::blas::BLAS, shader::compute::ComputePipeline, staging::DeviceLocalRingBuffer};
+use crate::Tree;
+use bevy::prelude::*;
 use dust_vdb::pool::PoolStorage;
 use pumicite::{
     Allocator,
     ash::vk,
-    buffer::{Buffer, BufferLike, RingBufferSuballocation},
-    command::CommandEncoder,
+    buffer::{Buffer, BufferLike},
     debug::DebugObject,
-    utils::AsVkHandle,
 };
-use smallvec::SmallVec;
 
 #[derive(Asset, TypePath)]
 pub struct VoxGeometry {
@@ -56,9 +49,7 @@ impl PoolStorage for VoxGeometryLeafStorage {
             self.allocator.clone(),
             size as u64,
             self.alignment as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         )
         .unwrap()
         .with_name(c"VoxGeometryLeafStorage");
@@ -88,137 +79,5 @@ impl VoxGeometry {
         )));
 
         Self { tree, unit_size }
-    }
-}
-
-#[derive(Resource)]
-pub struct BlasBuilder {
-    copy_coords_pipeline: Handle<ComputePipeline>,
-}
-impl FromWorld for BlasBuilder {
-    fn from_world(world: &mut World) -> Self {
-        BlasBuilder {
-            copy_coords_pipeline: world.load_asset(
-                "bazel://dust/crates/vox/shaders/blas_builder_copy_coords.comp.pipeline.bin",
-            ),
-        }
-    }
-}
-
-impl bevy_pumicite::rtx::blas::BLASBuilder for BlasBuilder {
-    type QueryData = &'static VoxModel;
-
-    type QueryFilter = Or<(Without<BLAS>, Changed<VoxModelBLASRebuild>)>;
-
-    type Params = (
-        SRes<Assets<VoxGeometry>>,
-        SResMut<DeviceLocalRingBuffer>,
-        SRes<Assets<ComputePipeline>>,
-    );
-
-    type BufferType = RingBufferSuballocation;
-
-    fn is_ready(
-        &self,
-        (_, _, compute_pipelines): &mut bevy::ecs::system::SystemParamItem<'_, '_, Self::Params>,
-    ) -> bool {
-        compute_pipelines.get(&self.copy_coords_pipeline).is_some()
-    }
-
-    fn geometries<'w, 's, 't, 't2, 'b, 'bb>(
-        &mut self,
-        (geometries, device_local_ring_buffer, compute_pipelines): &mut bevy::ecs::system::SystemParamItem<'w, 's, Self::Params>,
-        model: &VoxModel,
-        recorder: &'bb mut CommandEncoder<'b>,
-    ) -> impl Future<
-        Output = SmallVec<
-            [bevy_pumicite::rtx::blas::BLASBuildGeometry<'b, RingBufferSuballocation>; 1],
-        >,
-    > + use<'w, 's, 't, 't2, 'b, 'bb> {
-        let copy_coords_pipeline = compute_pipelines
-            .get(&self.copy_coords_pipeline)
-            .unwrap()
-            .clone();
-        let geometry = geometries.get(&model.geometry).unwrap();
-
-        let primitive_count = geometry.tree.pools()[0].used_capacity();
-        let leaf_storage: &dyn Any = geometry.tree.pools()[0].storage();
-        let leaf_storage = leaf_storage
-            .downcast_ref::<VoxGeometryLeafStorage>()
-            .unwrap();
-
-        // TODO: This buffer may not be device-local. Test perf when everything was pre-copied to device.
-        let device_buffer = leaf_storage.buffer.as_ref().map(Arc::clone);
-        let coords_buffer = if device_buffer.is_some() {
-            // TODO: query the alignment using minStorageBufferOffsetAlignment.
-            Some(device_local_ring_buffer.allocate_buffer(
-                primitive_count as u64 * size_of::<vk::AabbPositionsKHR>() as u64,
-                16,
-            ))
-        } else {
-            None
-        };
-
-        // Calculate the size of each leaf node AABB primitive.
-        let unit_size = geometry.unit_size * 4.0;
-
-        async move {
-            let Some(device_buffer) = device_buffer else {
-                return SmallVec::new();
-            };
-            let device_buffer = recorder.retain(device_buffer);
-            let coords_buffer = recorder.retain(coords_buffer.unwrap());
-            let copy_coords_pipeline = recorder.retain(copy_coords_pipeline.into_inner());
-            recorder.bind_pipeline(vk::PipelineBindPoint::COMPUTE, copy_coords_pipeline);
-            recorder.push_descriptor_set(
-                vk::PipelineBindPoint::COMPUTE,
-                copy_coords_pipeline.layout(),
-                0,
-                &[vk::WriteDescriptorSet {
-                    dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                    ..Default::default()
-                }
-                .buffer_info(&[
-                    vk::DescriptorBufferInfo {
-                        buffer: device_buffer.vk_handle(),
-                        offset: device_buffer.offset(),
-                        range: device_buffer.size().min(primitive_count as u64 * 4 * 4),
-                    },
-                    vk::DescriptorBufferInfo {
-                        buffer: coords_buffer.vk_handle(),
-                        offset: coords_buffer.offset(),
-                        range: coords_buffer.size().min(primitive_count as u64 * 6 * 4),
-                    },
-                ])],
-            );
-            recorder.push_constants(
-                copy_coords_pipeline.layout(),
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                unsafe {
-                    std::slice::from_raw_parts(
-                        &unit_size as *const f32 as *const u8,
-                        std::mem::size_of_val(&unit_size),
-                    )
-                },
-            );
-            recorder.dispatch(UVec3 {
-                x: primitive_count.div_ceil(32),
-                y: 1,
-                z: 1,
-            });
-            [bevy_pumicite::rtx::blas::BLASBuildGeometry::Aabbs {
-                buffer: coords_buffer,
-                stride: size_of::<vk::AabbPositionsKHR>() as u64,
-                flags: vk::GeometryFlagsKHR::OPAQUE,
-                primitive_count,
-            }]
-            .into()
-        }
-    }
-
-    fn batch_size(&self, _params: &mut bevy::ecs::system::SystemParamItem<'_, '_, Self::Params>) -> usize {
-        128
     }
 }

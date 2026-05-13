@@ -1,9 +1,5 @@
 #![feature(generic_const_exprs)]
-#![feature(alloc_layout_extra)]
 
-use bevy::ecs::entity::{Entity, MapEntities};
-use bevy::ecs::reflect::{ReflectComponent, ReflectMapEntities};
-use bevy::ecs::schedule::{IntoScheduleConfigs, Schedules};
 use bevy::math::U8Vec4;
 use bevy::prelude::*;
 use bevy::reflect::Reflect;
@@ -13,19 +9,12 @@ use bevy::{
     reflect::TypePath,
     transform::components::{GlobalTransform, Transform},
 };
-use bevy_pumicite::rtx::RtxPipelineManager;
-use bevy_pumicite::rtx::tlas::TLASInstance;
-use bevy_pumicite::shader::RayTracingPipelineLibrary;
 use bevy_pumicite::{CreateDevice, DefaultTransferSet, SubmissionState};
-use bytemuck::{Pod, Zeroable};
-use dot_vox::Color;
-use dust_pbr::PbrRenderState;
 use dust_vdb::hierarchy;
+use pumicite::Allocator;
 use pumicite::ash::{VkResult, vk};
-use pumicite::buffer::{Buffer, BufferLike, ManagedBuffer};
+use pumicite::buffer::{BufferLike, ManagedBuffer};
 use pumicite::device::DeviceBuilder;
-use pumicite::{Allocator, Device};
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 
 mod geometry;
@@ -84,6 +73,10 @@ impl VoxPalette {
             .copy_from_slice(bytemuck::cast_slice(&*arr));
         Ok(Self(buffer))
     }
+
+    pub fn device_address(&self) -> u64 {
+        self.0.device_address()
+    }
 }
 
 /// Marker component for Vox instances
@@ -97,23 +90,11 @@ pub struct VoxModel {
     pub geometry: Handle<VoxGeometry>,
     pub material: Handle<VoxMaterial>,
     pub palette: Handle<VoxPalette>,
-    pub sbt_index: u32,
-}
-
-/// A marker trait for requesting BLAS rebuilds.
-#[derive(Component, Default, Reflect)]
-#[reflect(Component)]
-pub struct VoxModelBLASRebuild;
-impl VoxModelBLASRebuild {
-    pub fn request_rebuild(&mut self) {
-        // No-op. BlasBuilder uses change tracker to schedule BLAS rebuilds.
-    }
 }
 
 #[derive(Bundle, Default)]
 pub struct VoxModelBundle {
     pub model: VoxModel,
-    pub blas_rebuild_tracker: VoxModelBLASRebuild,
 }
 
 #[derive(Bundle, Default)]
@@ -121,7 +102,6 @@ pub struct VoxInstanceBundle {
     pub transform: Transform,
     pub global_transform: GlobalTransform,
     pub instance: VoxInstance,
-    pub tlas_instance: TLASInstance<dust_pbr::PbrInstanceData>,
 }
 
 pub struct VoxPlugin;
@@ -131,13 +111,7 @@ impl Plugin for VoxPlugin {
             .init_asset::<VoxPalette>()
             .init_asset::<VoxMaterial>()
             .register_type::<VoxInstance>()
-            .register_type::<VoxModel>()
-            .register_type::<VoxModelBLASRebuild>();
-
-        // Build a BLAS for all entities with VoxModel and without the BLAS component.
-        app.add_plugins(bevy_pumicite::rtx::blas::BLASBuilderPlugin::<
-            geometry::BlasBuilder,
-        >::default());
+            .register_type::<VoxModel>();
 
         if app
             .world()
@@ -186,143 +160,6 @@ impl Plugin for VoxPlugin {
             })
             .after(CreateDevice),
         );
-
-        app.add_systems(Startup, setup.after(dust_pbr::setup));
-
-        app.add_systems(PostUpdate, write_sbt_entries.in_set(dust_pbr::PbrRenderSet));
-    }
-}
-
-#[derive(Resource)]
-pub struct VoxRenderState {
-    pipeline: Handle<RayTracingPipelineLibrary>,
-    hitgroup_index: u32,
-    shadow_pipeline: Handle<RayTracingPipelineLibrary>,
-    shadow_hitgroup_index: u32,
-    final_gather_pipeline: Handle<RayTracingPipelineLibrary>,
-    final_gather_hitgroup_index: u32,
-}
-
-fn setup(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut pipeline_manager: ResMut<RtxPipelineManager>,
-    pbr_render_state: Res<PbrRenderState>,
-) {
-    let hitgroup_library: Handle<RayTracingPipelineLibrary> =
-        asset_server.load("bazel://dust/crates/vox/shaders/vox_pbr.rtx.pipeline.bin");
-    let hitgroup_index = pipeline_manager
-        .add_hitgroup_for_pipeline(&pbr_render_state.pipeline, hitgroup_library.clone());
-
-    let shadow_hitgroup_library: Handle<RayTracingPipelineLibrary> =
-        asset_server.load("bazel://dust/crates/vox/shaders/vox_shadow.rtx.pipeline.bin");
-    let shadow_hitgroup_index = pipeline_manager.add_hitgroup_for_pipeline(
-        &pbr_render_state.shadow_pipeline,
-        shadow_hitgroup_library.clone(),
-    );
-
-    let final_gather_hitgroup_library: Handle<RayTracingPipelineLibrary> =
-        asset_server.load("bazel://dust/crates/vox/shaders/vox_final_gather.rtx.pipeline.bin");
-    let final_gather_hitgroup_index = pipeline_manager.add_hitgroup_for_pipeline(
-        &pbr_render_state.final_gather_pipeline,
-        final_gather_hitgroup_library.clone(),
-    );
-
-    commands.insert_resource(VoxRenderState {
-        pipeline: hitgroup_library,
-        hitgroup_index,
-        shadow_pipeline: shadow_hitgroup_library,
-        shadow_hitgroup_index,
-        final_gather_pipeline: final_gather_hitgroup_library,
-        final_gather_hitgroup_index,
-    });
-}
-
-#[derive(Pod, Clone, Copy, Zeroable)]
-#[repr(C)]
-struct VoxModelParams {
-    geometry_info: u64,
-    material_info: u64,
-    palette: u64,
-}
-
-fn write_sbt_entries(
-    mut models: Query<&mut VoxModel>,
-    mut instances: Query<(Entity, &mut TLASInstance<dust_pbr::PbrInstanceData>), With<VoxInstance>>,
-    mut pbr_state: ResMut<PbrRenderState>,
-    vox_render_state: Res<VoxRenderState>,
-
-    geometry_assets: Res<Assets<VoxGeometry>>,
-    material_assets: Res<Assets<VoxMaterial>>,
-    palette_assets: Res<Assets<VoxPalette>>,
-) {
-    let pbr_state = &mut *pbr_state;
-    let (Some(sbt), Some(shadow_sbt), Some(final_gather_sbt)) = (
-        pbr_state.sbt.as_mut(),
-        pbr_state.shadow_sbt.as_mut(),
-        pbr_state.final_gather_sbt.as_mut(),
-    ) else {
-        for mut model in models.iter_mut() {
-            model.sbt_index = u32::MAX;
-        }
-        for (_, mut instance) in instances.iter_mut() {
-            instance.disabled = true;
-        }
-        tracing::warn!("Missing SBT");
-        return;
-    };
-    for mut model in models.iter_mut() {
-        model.sbt_index = u32::MAX;
-        let Some(geometry) = geometry_assets.get(&model.geometry) else {
-            println!("no geometry");
-            continue;
-        };
-        let Some(material) = material_assets.get(&model.material) else {
-            println!("no material");
-            continue;
-        };
-        let Some(palette) = palette_assets.get(&model.palette) else {
-            println!("no palette");
-            continue;
-        };
-        let params = VoxModelParams {
-            geometry_info: geometry.tree.pools()[0].storage().device_address(),
-            material_info: material.buffer.device_address(),
-            palette: palette.0.device_address(),
-        };
-        model.sbt_index = sbt.push_hitgroup(vox_render_state.hitgroup_index, |param_dst| {
-            param_dst.copy_from_slice(bytemuck::bytes_of(&params));
-        });
-        // Push same geometry to shadow SBT (same order ensures matching sbt_offsets)
-        let shadow_sbt_index =
-            shadow_sbt.push_hitgroup(vox_render_state.shadow_hitgroup_index, |param_dst| {
-                param_dst.copy_from_slice(bytemuck::bytes_of(&params));
-            });
-        assert_eq!(shadow_sbt_index, model.sbt_index);
-        // Push same geometry to final gather SBT
-        let final_gather_sbt_index = final_gather_sbt.push_hitgroup(
-            vox_render_state.final_gather_hitgroup_index,
-            |param_dst| {
-                param_dst.copy_from_slice(bytemuck::bytes_of(&params));
-            },
-        );
-        assert_eq!(final_gather_sbt_index, model.sbt_index);
-    }
-    for (entity, mut instance) in instances.iter_mut() {
-        instance.disabled = true;
-        let Ok(model) = models.get(instance.blas) else {
-            tracing::warn!(
-                "Missing model {:?} for instance {:?}",
-                instance.blas,
-                entity
-            );
-            continue;
-        };
-        if model.sbt_index == u32::MAX {
-            continue;
-        }
-        instance.set_sbt_offset(model.sbt_index);
-        instance.disabled = false;
     }
 }
 

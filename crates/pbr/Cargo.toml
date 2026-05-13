@@ -5,10 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy.workspace = true
-pumicite.workspace = true
 bevy_pumicite.workspace = true
-pumicite_egui.workspace = true
-dust_denoiser.workspace = true
-tracing = "0.1"
 bytemuck = "1.23"
-glam = "0.30"
+dust_vox.workspace = true
+pumicite.workspace = true

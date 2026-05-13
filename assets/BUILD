@@ -1,5 +1,0 @@
-filegroup(
-    name = "runtime",
-    srcs = glob(["*.vox"]),
-    visibility = ["//visibility:public"],
-)

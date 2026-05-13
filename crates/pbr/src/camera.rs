@@ -3,8 +3,8 @@ use std::ops::Range;
 use bevy::{ecs::component::Component, math::UVec2};
 
 pub struct Viewport {
-    origin: UVec2,
-    size: UVec2,
+    pub origin: UVec2,
+    pub size: UVec2,
 }
 
 /// Parameters based on physical camera characteristics for calculating EV100
