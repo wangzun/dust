@@ -49,6 +49,10 @@ pub struct Camera {
     /// The focal length of the camera in meters.
     pub focal_length: f32,
 }
+
+#[derive(Component, Default)]
+pub struct SoftwareVoxelCamera;
+
 impl Camera {
     pub fn fov(&self) -> f32 {
         2.0 * (self.sensor_width / (2.0 * self.focal_length)).atan()

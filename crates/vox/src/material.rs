@@ -1,9 +1,15 @@
 use std::marker::PhantomData;
 
+use crate::{BindlessBufferHandle, BufferDescriptor};
 use bevy::{asset::Asset, math::UVec3, reflect::TypePath};
 use bitvec::{BitArr, array::BitArray};
 use dust_vdb::AttributeAllocator;
-use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
+use pumicite::{
+    Allocator,
+    ash::{VkResult, vk},
+    bindless::ResourceHeap,
+    buffer::ManagedBuffer,
+};
 
 #[derive(Debug, Clone)]
 pub struct VoxLeafNode {
@@ -24,6 +30,7 @@ impl Default for VoxLeafNode {
 pub struct VoxMaterial {
     pub attribute_allocator: AttributeAllocator,
     pub buffer: ManagedBuffer, // Wait so this actually do need to be a managedbuffer.
+    bindless_handle: Option<BindlessBufferHandle>,
 }
 impl VoxMaterial {
     pub fn new(allocator: Allocator) -> Self {
@@ -31,13 +38,28 @@ impl VoxMaterial {
             allocator,
             16 * 1024, // 16 KB to start,
             4,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
         Self {
             attribute_allocator: AttributeAllocator::new_with_capacity(16, 512),
             buffer,
+            bindless_handle: None,
         }
+    }
+
+    pub fn register_bindless(&mut self, heap: &ResourceHeap) -> VkResult<()> {
+        if self.bindless_handle.is_none() {
+            self.bindless_handle = Some(BindlessBufferHandle::new(
+                heap,
+                BufferDescriptor::new(&self.buffer),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn bindless_handle(&self) -> Option<u32> {
+        self.bindless_handle.as_ref().map(BindlessBufferHandle::get)
     }
 
     fn reserve(&mut self, size: u64) {
@@ -46,7 +68,7 @@ impl VoxMaterial {
                 self.buffer.allocator().clone(),
                 size.next_power_of_two(),
                 4,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
             )
             .unwrap();
             new_buffer.as_slice_mut()[0..self.buffer.size() as usize]

@@ -9,12 +9,14 @@ use bevy::{
     reflect::TypePath,
     transform::components::{GlobalTransform, Transform},
 };
-use bevy_pumicite::{CreateDevice, DefaultTransferSet, SubmissionState};
+use bevy_pumicite::{CreateDevice, DefaultTransferSet, DescriptorHeap, SubmissionState};
 use dust_vdb::hierarchy;
 use pumicite::Allocator;
 use pumicite::ash::{VkResult, vk};
+use pumicite::bindless::{BufferAccessMode, ResourceHeap};
 use pumicite::buffer::{BufferLike, ManagedBuffer};
 use pumicite::device::DeviceBuilder;
+use pumicite::utils::AsVkHandle;
 use std::ops::{Deref, DerefMut};
 
 mod geometry;
@@ -32,8 +34,89 @@ pub use loader::*;
 
 pub use geometry::VoxGeometry;
 
+#[derive(Clone, Copy)]
+pub struct BufferDescriptor {
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    device_address: vk::DeviceAddress,
+}
+
+impl BufferDescriptor {
+    pub fn new(buffer: &impl BufferLike) -> Self {
+        Self {
+            buffer: buffer.vk_handle(),
+            offset: buffer.offset(),
+            size: buffer.size(),
+            device_address: buffer.device_address(),
+        }
+    }
+}
+
+impl AsVkHandle for BufferDescriptor {
+    type Handle = vk::Buffer;
+
+    fn vk_handle(&self) -> Self::Handle {
+        self.buffer
+    }
+}
+
+impl BufferLike for BufferDescriptor {
+    fn offset(&self) -> vk::DeviceSize {
+        self.offset
+    }
+
+    fn device_address(&self) -> vk::DeviceAddress {
+        self.device_address
+    }
+
+    fn size(&self) -> vk::DeviceSize {
+        self.size
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn as_slice_mut(&mut self) -> Option<&mut [u8]> {
+        None
+    }
+
+    fn flush(&mut self, _range: impl std::ops::RangeBounds<vk::DeviceSize>) -> VkResult<()> {
+        Ok(())
+    }
+
+    fn invalidate(&mut self, _range: impl std::ops::RangeBounds<vk::DeviceSize>) -> VkResult<()> {
+        Ok(())
+    }
+}
+
+pub struct BindlessBufferHandle {
+    heap: ResourceHeap,
+    handle: u32,
+}
+
+impl BindlessBufferHandle {
+    pub fn new(heap: &ResourceHeap, buffer: impl BufferLike) -> VkResult<Self> {
+        Ok(Self {
+            heap: heap.clone(),
+            handle: heap.add_buffer(buffer, BufferAccessMode::Storage)?,
+        })
+    }
+
+    pub fn get(&self) -> u32 {
+        self.handle
+    }
+}
+
+impl Drop for BindlessBufferHandle {
+    fn drop(&mut self) {
+        self.heap.remove(self.handle);
+    }
+}
+
 #[derive(Asset, TypePath)]
-pub struct VoxPalette(ManagedBuffer);
+pub struct VoxPalette(ManagedBuffer, Option<BindlessBufferHandle>);
 
 impl Deref for VoxPalette {
     type Target = [U8Vec4];
@@ -47,6 +130,10 @@ impl DerefMut for VoxPalette {
     }
 }
 impl VoxPalette {
+    pub(crate) fn from_buffer(buffer: ManagedBuffer) -> Self {
+        Self(buffer, None)
+    }
+
     pub fn colorful(allocator: pumicite::Allocator) -> VkResult<Self> {
         use bevy::color::{Hsva, Srgba};
         let mut hue = 0.0;
@@ -62,20 +149,30 @@ impl VoxPalette {
             hue += 360.0 / 256.0;
         }
 
-        let mut buffer = ManagedBuffer::new(
-            allocator,
-            256 * 4,
-            4,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        )?;
+        let mut buffer =
+            ManagedBuffer::new(allocator, 256 * 4, 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
         buffer
             .as_slice_mut()
             .copy_from_slice(bytemuck::cast_slice(&*arr));
-        Ok(Self(buffer))
+        Ok(Self(buffer, None))
     }
 
-    pub fn device_address(&self) -> u64 {
-        self.0.device_address()
+    pub fn register_bindless(&mut self, heap: &ResourceHeap) -> VkResult<()> {
+        if self.1.is_none() {
+            self.1 = Some(BindlessBufferHandle::new(
+                heap,
+                BufferDescriptor::new(&self.0),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn bindless_handle(&self) -> Option<u32> {
+        self.1.as_ref().map(BindlessBufferHandle::get)
+    }
+
+    pub fn flush(&self, encoder: &mut pumicite::command::CommandEncoder) {
+        self.0.flush(encoder);
     }
 }
 
@@ -127,9 +224,6 @@ impl Plugin for VoxPlugin {
             Startup,
             (|mut device_builder: ResMut<DeviceBuilder>| {
                 device_builder
-                    .enable_extension::<pumicite::ash::khr::push_descriptor::Meta>()
-                    .unwrap();
-                device_builder
                     .enable_feature(|features: &mut vk::PhysicalDeviceFeatures| {
                         &mut features.shader_int64
                     })
@@ -155,8 +249,13 @@ impl Plugin for VoxPlugin {
 
         app.add_systems(
             Startup,
-            (|allocator: Res<Allocator>, asset_server: Res<AssetServer>| {
-                asset_server.register_loader(VoxLoader::new(allocator.clone()));
+            (|allocator: Res<Allocator>,
+              asset_server: Res<AssetServer>,
+              heap: Res<DescriptorHeap>| {
+                asset_server.register_loader(VoxLoader::new(
+                    allocator.clone(),
+                    heap.resource_heap().clone(),
+                ));
             })
             .after(CreateDevice),
         );
@@ -185,7 +284,7 @@ fn sync_buffers_system(
             match event {
                 AssetEvent::Added { id } | AssetEvent::Modified { id } => {
                     let palette = palettes.get(*id).unwrap();
-                    palette.0.flush(encoder);
+                    palette.flush(encoder);
                 }
                 _ => (),
             }

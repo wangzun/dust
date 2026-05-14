@@ -1,6 +1,7 @@
 use std::{alloc::Layout, any::Any, marker::PhantomData, mem::MaybeUninit};
 
 pub trait PoolStorage: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
     fn resize(&mut self, size: usize) -> *mut u8;
     fn device_address(&self) -> u64;
 }
@@ -13,6 +14,10 @@ pub struct DefaultPoolStorage {
 unsafe impl Send for DefaultPoolStorage {}
 unsafe impl Sync for DefaultPoolStorage {}
 impl PoolStorage for DefaultPoolStorage {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn device_address(&self) -> u64 {
         0
     }

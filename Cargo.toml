@@ -31,6 +31,7 @@ features = [
   "bevy_winit",
   "bevy_log",
   "bevy_window",
+  "bevy_camera",
   "bevy_asset",
   "bevy_scene",
   "free_camera",

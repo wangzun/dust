@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::{asset::AssetLoader, math::Vec3A, prelude::*, reflect::TypePath};
+use bevy_pumicite::DescriptorHeap;
 use dot_vox::{DotVoxData, Rotation, SceneNode};
+use pumicite::bindless::ResourceHeap;
 use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxModel, VoxModelBundle, VoxPalette,
-};
+use crate::{VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxModel, VoxPalette};
 
 enum WorldOrParent<'w, 'q> {
     World(&'w mut World),
@@ -187,16 +187,18 @@ pub enum VoxLoadingError {
 #[derive(TypePath)]
 pub struct VoxLoader {
     allocator: Allocator,
+    heap: ResourceHeap,
 }
 impl VoxLoader {
-    pub fn new(allocator: Allocator) -> Self {
-        Self { allocator }
+    pub fn new(allocator: Allocator, heap: ResourceHeap) -> Self {
+        Self { allocator, heap }
     }
 }
 impl FromWorld for VoxLoader {
     fn from_world(world: &mut World) -> Self {
         Self {
             allocator: world.resource::<Allocator>().clone(),
+            heap: world.resource::<DescriptorHeap>().resource_heap().clone(),
         }
     }
 }
@@ -252,17 +254,15 @@ impl AssetLoader for VoxLoader {
                 referenced_instances.len()
             );
 
-            let palette_handle = load_context.add_labeled_asset(
-                "Palette".into(),
-                VoxPalette(unsafe {
+            let palette_handle = load_context.add_labeled_asset("Palette".into(), {
+                let mut palette = VoxPalette::from_buffer(unsafe {
                     let arr = std::mem::take(&mut file.palette).into_boxed_slice();
                     assert_eq!(arr.len(), 256);
                     let mut buffer = ManagedBuffer::new(
                         self.allocator.clone(),
                         256 * 4,
                         4,
-                        vk::BufferUsageFlags::STORAGE_BUFFER
-                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                        vk::BufferUsageFlags::STORAGE_BUFFER,
                     )
                     .map_err(VoxLoadingError::VulkanError)?;
                     buffer
@@ -272,10 +272,14 @@ impl AssetLoader for VoxLoader {
                             256 * 4,
                         ));
                     buffer
-                }),
-            );
+                });
+                palette
+                    .register_bindless(&self.heap)
+                    .map_err(VoxLoadingError::VulkanError)?;
+                palette
+            });
 
-            let model_handles = {
+            let model_handles: BTreeMap<u32, VoxModel> = {
                 // Add models
                 let mut models: Vec<_> = std::mem::take(&mut file.models)
                     .into_iter()
@@ -292,36 +296,48 @@ impl AssetLoader for VoxLoader {
                     .collect::<Vec<_>>();
                 let handles = models
                     .par_iter()
-                    .map(|(model_id, model)| {
-                        let (tree, attribute_allocator) =
+                    .map(|(model_id, model)| -> Result<_, VoxLoadingError> {
+                        let (mut tree, mut attribute_allocator) =
                             self.model_to_tree(model, settings.unit_size);
-                        (*model_id, (tree, attribute_allocator))
+                        tree.register_bindless(&self.heap)
+                            .map_err(VoxLoadingError::VulkanError)?;
+                        attribute_allocator
+                            .register_bindless(&self.heap)
+                            .map_err(VoxLoadingError::VulkanError)?;
+                        Ok((*model_id, (tree, attribute_allocator)))
                     })
                     .collect_vec_list();
-                let bundles =
-                    handles
-                        .into_iter()
-                        .flat_map(|a| a)
-                        .map(|(model_id, (tree, material))| {
-                            let geometry = load_context
-                                .add_labeled_asset(format!("Geometry{}", model_id), tree);
-                            let material = load_context
-                                .add_labeled_asset(format!("Material{}", model_id), material);
-                            let bundle = VoxModelBundle {
-                                model: VoxModel {
-                                    geometry,
-                                    material,
-                                    palette: palette_handle.clone(),
-                                },
-                                ..Default::default()
-                            };
-                            bundle
-                        });
-                let entities = world.spawn_batch(bundles);
-                BTreeMap::from_iter(referenced_models.into_iter().zip(entities))
+                let handles = handles
+                    .into_iter()
+                    .flat_map(|a| a)
+                    .collect::<Result<Vec<_>, _>>()?;
+                BTreeMap::from_iter(handles.into_iter().map(|(model_id, (tree, material))| {
+                    let geometry =
+                        load_context.add_labeled_asset(format!("Geometry{}", model_id), tree);
+                    let material =
+                        load_context.add_labeled_asset(format!("Material{}", model_id), material);
+                    (
+                        model_id,
+                        VoxModel {
+                            geometry,
+                            material,
+                            palette: palette_handle.clone(),
+                        },
+                    )
+                }))
             };
 
-            let _ = (model_handles, referenced_instances);
+            for (model_id, entity) in referenced_instances {
+                let Some(model) = model_handles.get(&model_id) else {
+                    continue;
+                };
+                world.entity_mut(entity).insert(VoxModel {
+                    geometry: model.geometry.clone(),
+                    material: model.material.clone(),
+                    palette: model.palette.clone(),
+                });
+            }
+
             let scene = bevy::scene::Scene::new(world);
 
             tracing::info!("Scene spawned");

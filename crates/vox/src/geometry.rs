@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
-use crate::Tree;
+use crate::{BindlessBufferHandle, BufferDescriptor, Tree};
 use bevy::prelude::*;
 use dust_vdb::pool::PoolStorage;
 use pumicite::{
     Allocator,
-    ash::vk,
+    ash::{VkResult, vk},
+    bindless::ResourceHeap,
     buffer::{Buffer, BufferLike},
     debug::DebugObject,
 };
@@ -16,6 +17,7 @@ pub struct VoxGeometry {
 
     /// Model space size of each voxel
     pub unit_size: f32,
+    bindless_handle: Option<BindlessBufferHandle>,
 }
 
 pub struct VoxGeometryLeafStorage {
@@ -37,6 +39,10 @@ impl VoxGeometryLeafStorage {
     }
 }
 impl PoolStorage for VoxGeometryLeafStorage {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn device_address(&self) -> u64 {
         if let Some(buffer) = self.buffer.as_ref() {
             buffer.device_address()
@@ -49,7 +55,7 @@ impl PoolStorage for VoxGeometryLeafStorage {
             self.allocator.clone(),
             size as u64,
             self.alignment as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap()
         .with_name(c"VoxGeometryLeafStorage");
@@ -78,6 +84,36 @@ impl VoxGeometry {
             crate::Tree::metas()[0].layout.align(),
         )));
 
-        Self { tree, unit_size }
+        Self {
+            tree,
+            unit_size,
+            bindless_handle: None,
+        }
+    }
+
+    pub fn register_bindless(&mut self, heap: &ResourceHeap) -> VkResult<()> {
+        if self.bindless_handle.is_none() {
+            let Some(buffer) = self.storage_buffer() else {
+                return Ok(());
+            };
+            self.bindless_handle = Some(BindlessBufferHandle::new(
+                heap,
+                BufferDescriptor::new(buffer.as_ref()),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn bindless_handle(&self) -> Option<u32> {
+        self.bindless_handle.as_ref().map(BindlessBufferHandle::get)
+    }
+
+    fn storage_buffer(&self) -> Option<Arc<Buffer>> {
+        self.tree.pools()[0]
+            .storage()
+            .as_any()
+            .downcast_ref::<VoxGeometryLeafStorage>()?
+            .buffer
+            .clone()
     }
 }
