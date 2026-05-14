@@ -1,6 +1,6 @@
 pub mod camera;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use bevy::math::Affine3A;
 use bevy::prelude::*;
@@ -20,10 +20,9 @@ use pumicite::{
 
 use crate::camera::{Camera, SoftwareVoxelCamera};
 
-const MAX_GENERATED_TRIANGLES: u32 = 1024 * 1024;
-const MAX_GENERATED_VERTICES: u32 = MAX_GENERATED_TRIANGLES * 3;
+const MAX_VISIBLE_CLUSTERS: u32 = 2 * 1024 * 1024;
 const MAX_MESH_PARAMS: usize = 4096;
-const GENERATED_VERTEX_SIZE: u64 = 48;
+const VISIBLE_CLUSTER_SIZE: u64 = 48;
 const INDIRECT_BUFFER_SIZE: u64 = std::mem::size_of::<vk::DrawIndirectCommand>() as u64;
 
 pub struct PbrRenderPlugin;
@@ -69,14 +68,14 @@ struct SoftwareVoxelPipeline {
 
 #[derive(Resource)]
 struct SoftwareMeshResources {
-    vertices: Arc<Buffer>,
+    clusters: Arc<Buffer>,
     indirect: Arc<Buffer>,
     params: Arc<Buffer>,
-    vertices_handle: BindlessBufferHandle,
+    clusters_handle: BindlessBufferHandle,
     indirect_handle: BindlessBufferHandle,
     params_handle: BindlessBufferHandle,
     depth: GPUMutex<FullImageView<Image>>,
-    vertex_state: ResourceState,
+    cluster_state: ResourceState,
     indirect_state: ResourceState,
     params_state: ResourceState,
     depth_state: ResourceState,
@@ -100,7 +99,7 @@ const _: () = assert!(std::mem::size_of::<SoftwareVoxelMeshUniform>() == 144);
 struct SoftwareVoxelPushConstants {
     params_handle: u32,
     params_index: u32,
-    vertices_handle: u32,
+    clusters_handle: u32,
     indirect_handle: u32,
 }
 
@@ -132,15 +131,15 @@ fn ensure_mesh_resources(
         return;
     }
 
-    let vertices = Arc::new(
+    let clusters = Arc::new(
         Buffer::new_private(
             allocator.clone(),
-            MAX_GENERATED_VERTICES as u64 * GENERATED_VERTEX_SIZE,
+            MAX_VISIBLE_CLUSTERS as u64 * VISIBLE_CLUSTER_SIZE,
             16,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap()
-        .with_name(c"Software Voxel Generated Vertices"),
+        .with_name(c"Software Voxel Visible Clusters"),
     );
     let indirect = Arc::new(
         Buffer::new_private(
@@ -166,8 +165,8 @@ fn ensure_mesh_resources(
     );
 
     let resource_heap = heap.resource_heap();
-    let vertices_handle =
-        BindlessBufferHandle::new(resource_heap, BufferDescriptor::new(vertices.as_ref())).unwrap();
+    let clusters_handle =
+        BindlessBufferHandle::new(resource_heap, BufferDescriptor::new(clusters.as_ref())).unwrap();
     let indirect_handle =
         BindlessBufferHandle::new(resource_heap, BufferDescriptor::new(indirect.as_ref())).unwrap();
     let params_handle =
@@ -196,10 +195,10 @@ fn ensure_mesh_resources(
     .with_name(c"Software Voxel Depth");
 
     commands.insert_resource(SoftwareMeshResources {
-        vertices,
+        clusters,
         indirect,
         params,
-        vertices_handle,
+        clusters_handle,
         indirect_handle,
         params_handle,
         depth: GPUMutex::new(
@@ -208,7 +207,7 @@ fn ensure_mesh_resources(
                 .unwrap()
                 .with_name(c"Software Voxel Depth View"),
         ),
-        vertex_state: ResourceState::default(),
+        cluster_state: ResourceState::default(),
         indirect_state: ResourceState::default(),
         params_state: ResourceState::default(),
         depth_state: ResourceState::default(),
@@ -230,6 +229,7 @@ fn render(
     geometries: Res<Assets<VoxGeometry>>,
     materials: Res<Assets<VoxMaterial>>,
     palettes: Res<Assets<VoxPalette>>,
+    mut bounds_cache: Local<HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>>,
 ) {
     let Ok(mut swapchain_image) = swapchain_image.single_mut() else {
         return;
@@ -246,6 +246,7 @@ fn render(
 
     let base_uniform = empty_uniform(camera, camera_transform, resources.extent);
     let mut mesh_uniforms = Vec::new();
+    let mut total_blocks = 0u32;
     for (model, global_transform, local_transform) in models.iter() {
         let Some(geometry) = geometries.get(&model.geometry) else {
             continue;
@@ -268,9 +269,24 @@ fn render(
                     .map(Transform::compute_affine)
                     .unwrap_or(Affine3A::IDENTITY)
             });
+        if let Some((local_min, local_max)) =
+            geometry_bounds(&mut bounds_cache, model.geometry.id(), geometry)
+        {
+            if !aabb_visible(
+                camera,
+                camera_transform,
+                resources.extent,
+                affine,
+                geometry.unit_size,
+                local_min,
+                local_max,
+            ) {
+                continue;
+            }
+        }
         let mut uniform = base_uniform;
         uniform.model_rows = affine_rows(affine, geometry.unit_size);
-        uniform.mesh_params = [block_count, MAX_GENERATED_VERTICES, 1, 0];
+        uniform.mesh_params = [block_count, MAX_VISIBLE_CLUSTERS, 0, total_blocks];
         let (Some(geometry_handle), Some(material_handle), Some(palette_handle)) = (
             geometry.bindless_handle(),
             material.bindless_handle(),
@@ -280,7 +296,8 @@ fn render(
         };
         uniform.resource_handles = [geometry_handle, material_handle, palette_handle, 0];
         mesh_uniforms.push(uniform);
-        if mesh_uniforms.len() + 3 >= MAX_MESH_PARAMS {
+        total_blocks = total_blocks.saturating_add(block_count);
+        if mesh_uniforms.len() + 4 >= MAX_MESH_PARAMS {
             break;
         }
     }
@@ -290,21 +307,26 @@ fn render(
             return;
         };
 
-        let _vertices = encoder.retain(resources.vertices.clone());
+        let _clusters = encoder.retain(resources.clusters.clone());
         let indirect = encoder.retain(resources.indirect.clone());
         let params = encoder.retain(resources.params.clone());
         encoder.use_resource::<()>(&mut resources.indirect_state, Access::COPY_WRITE);
         encoder.use_resource::<()>(&mut resources.params_state, Access::COPY_WRITE);
         encoder.update_buffer(indirect.as_ref(), &[0; INDIRECT_BUFFER_SIZE as usize]);
-        let mut dispatch_params = Vec::with_capacity(mesh_uniforms.len() + 3);
+        let mut dispatch_params = Vec::with_capacity(mesh_uniforms.len() + 4);
         let mut init_uniform = base_uniform;
-        init_uniform.mesh_params = [0, MAX_GENERATED_VERTICES, 0, 0];
+        init_uniform.mesh_params = [0, MAX_VISIBLE_CLUSTERS, 0, 0];
         dispatch_params.push(init_uniform);
+        let mut emit_uniform = base_uniform;
+        emit_uniform.mesh_params = [mesh_uniforms.len() as u32, MAX_VISIBLE_CLUSTERS, 1, 2];
+        dispatch_params.push(emit_uniform);
         dispatch_params.extend(mesh_uniforms.iter().copied());
         let mut finalize_uniform = base_uniform;
-        finalize_uniform.mesh_params = [0, MAX_GENERATED_VERTICES, 2, 0];
+        finalize_uniform.mesh_params = [0, MAX_VISIBLE_CLUSTERS, 2, 0];
         dispatch_params.push(finalize_uniform);
-        dispatch_params.push(base_uniform);
+        let mut draw_uniform = base_uniform;
+        draw_uniform.mesh_params = [36, MAX_VISIBLE_CLUSTERS, 3, 0];
+        dispatch_params.push(draw_uniform);
         upload_params_buffer(
             encoder,
             &mut staging,
@@ -315,7 +337,7 @@ fn render(
             stage: vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::VERTEX_SHADER,
             access: vk::AccessFlags2::SHADER_STORAGE_READ,
         };
-        encoder.use_resource::<()>(&mut resources.vertex_state, Access::COMPUTE_WRITE);
+        encoder.use_resource::<()>(&mut resources.cluster_state, Access::COMPUTE_WRITE);
         encoder.use_resource::<()>(&mut resources.indirect_state, Access::COMPUTE_WRITE);
         encoder.use_resource::<()>(&mut resources.params_state, params_shader_read);
         encoder.emit_barriers();
@@ -327,13 +349,13 @@ fn render(
         dispatch_mesh_pipeline(encoder, &mesh_pipeline, &resources, 0, UVec3::ONE);
         compute_mesh_barrier(encoder);
 
-        for (index, uniform) in mesh_uniforms.iter().enumerate() {
+        if total_blocks > 0 && !mesh_uniforms.is_empty() {
             dispatch_mesh_pipeline(
                 encoder,
                 &mesh_pipeline,
                 &resources,
-                (index + 1) as u32,
-                UVec3::new(uniform.mesh_params[0].div_ceil(64), 1, 1),
+                1,
+                UVec3::new(total_blocks.div_ceil(64), 1, 1),
             );
             compute_mesh_barrier(encoder);
         }
@@ -342,11 +364,11 @@ fn render(
             encoder,
             &mesh_pipeline,
             &resources,
-            (mesh_uniforms.len() + 1) as u32,
+            (mesh_uniforms.len() + 2) as u32,
             UVec3::ONE,
         );
 
-        let vertex_shader_read = Access {
+        let cluster_shader_read = Access {
             stage: vk::PipelineStageFlags2::VERTEX_SHADER,
             access: vk::AccessFlags2::SHADER_STORAGE_READ,
         };
@@ -354,7 +376,7 @@ fn render(
             stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
             access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
         };
-        encoder.use_resource::<()>(&mut resources.vertex_state, vertex_shader_read);
+        encoder.use_resource::<()>(&mut resources.cluster_state, cluster_shader_read);
         encoder.use_resource::<()>(&mut resources.indirect_state, indirect_read);
 
         let current_swapchain_image = encoder.lock(
@@ -436,8 +458,8 @@ fn render(
             0,
             bytemuck::bytes_of(&SoftwareVoxelPushConstants {
                 params_handle: resources.params_handle.get(),
-                params_index: (mesh_uniforms.len() + 2) as u32,
-                vertices_handle: resources.vertices_handle.get(),
+                params_index: (mesh_uniforms.len() + 3) as u32,
+                clusters_handle: resources.clusters_handle.get(),
                 indirect_handle: resources.indirect_handle.get(),
             }),
         );
@@ -460,7 +482,7 @@ fn dispatch_mesh_pipeline<'a>(
         bytemuck::bytes_of(&SoftwareVoxelPushConstants {
             params_handle: resources.params_handle.get(),
             params_index,
-            vertices_handle: resources.vertices_handle.get(),
+            clusters_handle: resources.clusters_handle.get(),
             indirect_handle: resources.indirect_handle.get(),
         }),
     );
@@ -498,6 +520,69 @@ fn compute_mesh_barrier(encoder: &mut pumicite::command::CommandEncoder<'_>) {
     encoder.emit_barriers();
 }
 
+fn geometry_bounds(
+    cache: &mut HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>,
+    id: AssetId<VoxGeometry>,
+    geometry: &VoxGeometry,
+) -> Option<(Vec3, Vec3)> {
+    *cache.entry(id).or_insert_with(|| {
+        let mut iter = geometry.tree.iter();
+        let first = iter.next()?;
+        let mut min = first;
+        let mut max = first;
+        for voxel in iter {
+            min = min.min(voxel);
+            max = max.max(voxel);
+        }
+        Some((min.as_vec3(), max.as_vec3() + Vec3::ONE))
+    })
+}
+
+fn aabb_visible(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    extent: UVec2,
+    affine: Affine3A,
+    unit_size: f32,
+    local_min: Vec3,
+    local_max: Vec3,
+) -> bool {
+    let mut model_affine = affine;
+    model_affine.matrix3.x_axis *= unit_size;
+    model_affine.matrix3.y_axis *= unit_size;
+    model_affine.matrix3.z_axis *= unit_size;
+
+    let mut world_min = Vec3A::splat(f32::INFINITY);
+    let mut world_max = Vec3A::splat(f32::NEG_INFINITY);
+    for x in [local_min.x, local_max.x] {
+        for y in [local_min.y, local_max.y] {
+            for z in [local_min.z, local_max.z] {
+                let corner = model_affine.transform_point3a(Vec3A::new(x, y, z));
+                world_min = world_min.min(corner);
+                world_max = world_max.max(corner);
+            }
+        }
+    }
+
+    let center = (world_min + world_max) * 0.5;
+    let radius = (world_max - center).length();
+    let camera_affine = camera_transform.affine();
+    let rel = center - camera_affine.translation;
+    let camera_x = rel.dot(camera_affine.matrix3.x_axis);
+    let camera_y = rel.dot(camera_affine.matrix3.y_axis);
+    let forward = rel.dot(-camera_affine.matrix3.z_axis);
+
+    if forward + radius <= camera.depth.start || forward - radius >= camera.depth.end {
+        return false;
+    }
+
+    let tan_half_fov = camera.tan_half_fov();
+    let aspect = extent.x as f32 / extent.y.max(1) as f32;
+    let forward = forward.max(camera.depth.start);
+    camera_x.abs() <= forward * tan_half_fov * aspect + radius
+        && camera_y.abs() <= forward * tan_half_fov + radius
+}
+
 fn empty_uniform(
     camera: &Camera,
     transform: &GlobalTransform,
@@ -522,7 +607,7 @@ fn empty_uniform(
             camera.depth.start,
             camera.depth.end,
         ],
-        mesh_params: [0, MAX_GENERATED_VERTICES, 0, 0],
+        mesh_params: [0, MAX_VISIBLE_CLUSTERS, 0, 0],
         resource_handles: [0; 4],
     }
 }

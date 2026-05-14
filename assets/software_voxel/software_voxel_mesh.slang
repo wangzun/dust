@@ -24,10 +24,10 @@ struct Block {
     uint material_ptr;
 };
 
-struct GeneratedVertex {
-    float4 position;
+struct VisibleCluster {
+    float4 local_min_size;
     float4 color;
-    float4 normal;
+    uint4 meta;
 };
 
 struct RenderParams {
@@ -52,17 +52,13 @@ uint popcount64(uint64_t value)
     return countbits(uint(value & 0xffffffffUL)) + countbits(uint(value >> 32));
 }
 
-uint voxel_id(int3 voxel)
+uint voxel_id(uint3 voxel)
 {
-    return (uint(voxel.x) << 4) | (uint(voxel.y) << 2) | uint(voxel.z);
+    return (voxel.x << 4) | (voxel.y << 2) | voxel.z;
 }
 
-bool occupied(uint64_t mask, int3 voxel)
+bool occupied(uint64_t mask, uint3 voxel)
 {
-    if (any(voxel < int3(0)) || any(voxel >= int3(4)))
-    {
-        return false;
-    }
     return ((mask >> voxel_id(voxel)) & 1UL) != 0UL;
 }
 
@@ -72,14 +68,6 @@ float3 transform_position(RenderParams params, float3 position)
         dot(params.model_row0.xyz, position) + params.model_row0.w,
         dot(params.model_row1.xyz, position) + params.model_row1.w,
         dot(params.model_row2.xyz, position) + params.model_row2.w);
-}
-
-float3 transform_normal(RenderParams params, float3 normal)
-{
-    return normalize(float3(
-        dot(params.model_row0.xyz, normal),
-        dot(params.model_row1.xyz, normal),
-        dot(params.model_row2.xyz, normal)));
 }
 
 float3 palette_color(RenderParams params, StructuredBuffer<uint32_t>.Handle material_info, StructuredBuffer<uint32_t>.Handle palette_info, Block block, uint hit_voxel_id)
@@ -96,68 +84,123 @@ float3 palette_color(RenderParams params, StructuredBuffer<uint32_t>.Handle mate
         float((packed >> 16) & 255u)) / 255.0;
 }
 
-void write_vertex(RenderParams params, RWStructuredBuffer<GeneratedVertex>.Handle vertices, uint index, float3 local_position, float3 color, float3 normal)
+bool block_visible(RenderParams params, float3 local_min, float size)
 {
-    vertices[index].position = float4(transform_position(params, local_position), 1.0);
-    vertices[index].color = float4(color, 1.0);
-    vertices[index].normal = float4(normal, 0.0);
+    float3 center = local_min + float3(size * 0.5);
+    float3 world_center = transform_position(params, center);
+    float3 camera_origin = float3(params.camera_axis_x.w, params.camera_axis_y.w, params.camera_axis_z.w);
+    float3 rel = world_center - camera_origin;
+    float camera_x = dot(rel, params.camera_axis_x.xyz);
+    float camera_y = dot(rel, params.camera_axis_y.xyz);
+    float forward = dot(rel, -params.camera_axis_z.xyz);
+
+    float radius = max(length(params.model_row0.xyz), max(length(params.model_row1.xyz), length(params.model_row2.xyz))) * size * 0.9;
+    float near_z = params.camera_params.z;
+    float far_z = params.camera_params.w;
+    if (forward + radius <= near_z || forward - radius >= far_z)
+    {
+        return false;
+    }
+
+    float tan_half_fov = params.camera_params.x;
+    float aspect = params.camera_params.y;
+    if (abs(camera_x) > max(forward, near_z) * tan_half_fov * aspect + radius)
+    {
+        return false;
+    }
+    if (abs(camera_y) > max(forward, near_z) * tan_half_fov + radius)
+    {
+        return false;
+    }
+    return true;
 }
 
-float3 face_normal(uint face)
+uint select_lod_group_size(RenderParams params, float3 local_min)
 {
-    if (face == 0u) { return float3(-1.0, 0.0, 0.0); }
-    if (face == 1u) { return float3( 1.0, 0.0, 0.0); }
-    if (face == 2u) { return float3(0.0, -1.0, 0.0); }
-    if (face == 3u) { return float3(0.0,  1.0, 0.0); }
-    if (face == 4u) { return float3(0.0, 0.0, -1.0); }
-    return float3(0.0, 0.0, 1.0);
+    float3 world_center = transform_position(params, local_min + float3(2.0));
+    float3 camera_origin = float3(params.camera_axis_x.w, params.camera_axis_y.w, params.camera_axis_z.w);
+    float distance = length(world_center - camera_origin);
+
+    if (distance < 72.0)
+    {
+        return 1u;
+    }
+    if (distance < 220.0)
+    {
+        return 2u;
+    }
+    return 4u;
 }
 
-void emit_face(RenderParams params, RWStructuredBuffer<GeneratedVertex>.Handle vertices, RWStructuredBuffer<uint>.Handle draw_args, float3 p, uint face, float3 color)
+void emit_cluster(
+    RenderParams params,
+    RWStructuredBuffer<VisibleCluster>.Handle clusters,
+    RWStructuredBuffer<uint>.Handle draw_args,
+    uint params_index,
+    float3 local_min,
+    float size,
+    float3 color)
 {
-    uint base_vertex;
-    InterlockedAdd(draw_args[0], 6u, base_vertex);
-    if (base_vertex + 6u > params.mesh_params.y)
+    uint cluster_index;
+    InterlockedAdd(draw_args[1], 1u, cluster_index);
+    if (cluster_index >= params.mesh_params.y)
     {
         return;
     }
 
-    float3 a;
-    float3 b;
-    float3 c;
-    float3 d;
-    if (face == 0u)
+    clusters[cluster_index].local_min_size = float4(local_min, size);
+    clusters[cluster_index].color = float4(color, 1.0);
+    clusters[cluster_index].meta = uint4(params_index, 0u, 0u, 0u);
+}
+
+void emit_group(
+    RenderParams params,
+    RWStructuredBuffer<VisibleCluster>.Handle clusters,
+    RWStructuredBuffer<uint>.Handle draw_args,
+    StructuredBuffer<uint32_t>.Handle material_info,
+    StructuredBuffer<uint32_t>.Handle palette_info,
+    Block block,
+    uint params_index,
+    uint3 block_origin,
+    uint3 group_origin,
+    uint group_size)
+{
+    float3 color_sum = float3(0.0);
+    uint color_count = 0u;
+
+    for (uint x = 0u; x < group_size; x++)
     {
-        a = p + float3(0, 0, 0); b = p + float3(0, 0, 1); c = p + float3(0, 1, 1); d = p + float3(0, 1, 0);
-    }
-    else if (face == 1u)
-    {
-        a = p + float3(1, 0, 0); b = p + float3(1, 1, 0); c = p + float3(1, 1, 1); d = p + float3(1, 0, 1);
-    }
-    else if (face == 2u)
-    {
-        a = p + float3(0, 0, 0); b = p + float3(1, 0, 0); c = p + float3(1, 0, 1); d = p + float3(0, 0, 1);
-    }
-    else if (face == 3u)
-    {
-        a = p + float3(0, 1, 0); b = p + float3(0, 1, 1); c = p + float3(1, 1, 1); d = p + float3(1, 1, 0);
-    }
-    else if (face == 4u)
-    {
-        a = p + float3(0, 0, 0); b = p + float3(0, 1, 0); c = p + float3(1, 1, 0); d = p + float3(1, 0, 0);
-    }
-    else
-    {
-        a = p + float3(0, 0, 1); b = p + float3(1, 0, 1); c = p + float3(1, 1, 1); d = p + float3(0, 1, 1);
+        for (uint y = 0u; y < group_size; y++)
+        {
+            for (uint z = 0u; z < group_size; z++)
+            {
+                uint3 local_voxel = group_origin + uint3(x, y, z);
+                if (any(local_voxel >= uint3(4u)))
+                {
+                    continue;
+                }
+                if (!occupied(block.mask, local_voxel))
+                {
+                    continue;
+                }
+                color_sum += palette_color(params, material_info, palette_info, block, voxel_id(local_voxel));
+                color_count++;
+            }
+        }
     }
 
-    float3 normal = transform_normal(params, face_normal(face));
-    write_vertex(params, vertices, base_vertex + 0u, a, color, normal);
-    write_vertex(params, vertices, base_vertex + 1u, b, color, normal);
-    write_vertex(params, vertices, base_vertex + 2u, c, color, normal);
-    write_vertex(params, vertices, base_vertex + 3u, a, color, normal);
-    write_vertex(params, vertices, base_vertex + 4u, c, color, normal);
-    write_vertex(params, vertices, base_vertex + 5u, d, color, normal);
+    if (color_count == 0u)
+    {
+        return;
+    }
+
+    float size = float(group_size);
+    float3 local_min = float3(block_origin + group_origin);
+    if (!block_visible(params, local_min, size))
+    {
+        return;
+    }
+    emit_cluster(params, clusters, draw_args, params_index, local_min, size, color_sum / float(color_count));
 }
 
 [numthreads(64, 1, 1)]
@@ -165,20 +208,21 @@ void meshMain(
     uint3 dispatch_thread_id : SV_DispatchThreadID,
     uniform uint32_t params_handle,
     uniform uint32_t params_index,
-    uniform uint32_t vertices_handle,
+    uniform uint32_t clusters_handle,
     uniform uint32_t indirect_handle)
 {
     StructuredBuffer<RenderParams>.Handle params_buffer = (StructuredBuffer<RenderParams>.Handle)params_handle;
-    RWStructuredBuffer<GeneratedVertex>.Handle vertices = (RWStructuredBuffer<GeneratedVertex>.Handle)vertices_handle;
+    RWStructuredBuffer<VisibleCluster>.Handle clusters = (RWStructuredBuffer<VisibleCluster>.Handle)clusters_handle;
     RWStructuredBuffer<uint>.Handle draw_args = (RWStructuredBuffer<uint>.Handle)indirect_handle;
-    RenderParams params = params_buffer[params_index];
-    uint mode = params.mesh_params.z;
+    RenderParams control = params_buffer[params_index];
+    uint mode = control.mesh_params.z;
+
     if (mode == 0u)
     {
         if (dispatch_thread_id.x == 0u)
         {
-            draw_args[0] = 0u;
-            draw_args[1] = 1u;
+            draw_args[0] = 36u;
+            draw_args[1] = 0u;
             draw_args[2] = 0u;
             draw_args[3] = 0u;
         }
@@ -189,47 +233,78 @@ void meshMain(
     {
         if (dispatch_thread_id.x == 0u)
         {
-            draw_args[0] = min(draw_args[0], params.mesh_params.y);
-            draw_args[1] = 1u;
+            draw_args[0] = 36u;
+            draw_args[1] = min(draw_args[1], control.mesh_params.y);
             draw_args[2] = 0u;
             draw_args[3] = 0u;
         }
         return;
     }
 
-    uint block_index = dispatch_thread_id.x;
-    StructuredBuffer<Block>.Handle geometry_info = (StructuredBuffer<Block>.Handle)params.resource_handles.x;
-    StructuredBuffer<uint32_t>.Handle material_info = (StructuredBuffer<uint32_t>.Handle)params.resource_handles.y;
-    StructuredBuffer<uint32_t>.Handle palette_info = (StructuredBuffer<uint32_t>.Handle)params.resource_handles.z;
-
-    if (block_index >= params.mesh_params.x)
+    uint global_block_index = dispatch_thread_id.x;
+    uint instance_count = control.mesh_params.x;
+    uint first_instance_param = control.mesh_params.w;
+    uint low = 0u;
+    uint high = instance_count;
+    while (low < high)
+    {
+        uint mid = (low + high) >> 1u;
+        uint candidate_index = first_instance_param + mid;
+        RenderParams candidate = params_buffer[candidate_index];
+        if (candidate.mesh_params.w <= global_block_index)
+        {
+            low = mid + 1u;
+        }
+        else
+        {
+            high = mid;
+        }
+    }
+    if (low == 0u)
     {
         return;
     }
 
-    Block block = geometry_info[block_index];
+    uint instance_param_index = first_instance_param + low - 1u;
+    RenderParams params = params_buffer[instance_param_index];
+    uint block_count = params.mesh_params.x;
+    uint block_base = params.mesh_params.w;
+    if (global_block_index < block_base || global_block_index >= block_base + block_count)
+    {
+        return;
+    }
+    uint local_block_index = global_block_index - block_base;
+
+    StructuredBuffer<Block>.Handle geometry_info = (StructuredBuffer<Block>.Handle)params.resource_handles.x;
+    StructuredBuffer<uint32_t>.Handle material_info = (StructuredBuffer<uint32_t>.Handle)params.resource_handles.y;
+    StructuredBuffer<uint32_t>.Handle palette_info = (StructuredBuffer<uint32_t>.Handle)params.resource_handles.z;
+
+    Block block = geometry_info[local_block_index];
     if (block.mask == 0UL)
     {
         return;
     }
 
     uint3 block_origin = unpack_block_coords(block.coords_packed);
-    for (uint voxel = 0u; voxel < 64u; voxel++)
+    uint group_size = select_lod_group_size(params, float3(block_origin));
+    for (uint x = 0u; x < 4u; x += group_size)
     {
-        if (((block.mask >> voxel) & 1UL) == 0UL)
+        for (uint y = 0u; y < 4u; y += group_size)
         {
-            continue;
+            for (uint z = 0u; z < 4u; z += group_size)
+            {
+                emit_group(
+                    params,
+                    clusters,
+                    draw_args,
+                    material_info,
+                    palette_info,
+                    block,
+                    instance_param_index,
+                    block_origin,
+                    uint3(x, y, z),
+                    group_size);
+            }
         }
-
-        int3 local_voxel = int3(int(voxel >> 4), int((voxel >> 2) & 3u), int(voxel & 3u));
-        float3 p = float3(block_origin + uint3(local_voxel));
-        float3 color = palette_color(params, material_info, palette_info, block, voxel);
-
-        if (!occupied(block.mask, local_voxel + int3(-1, 0, 0))) { emit_face(params, vertices, draw_args, p, 0u, color); }
-        if (!occupied(block.mask, local_voxel + int3( 1, 0, 0))) { emit_face(params, vertices, draw_args, p, 1u, color); }
-        if (!occupied(block.mask, local_voxel + int3(0, -1, 0))) { emit_face(params, vertices, draw_args, p, 2u, color); }
-        if (!occupied(block.mask, local_voxel + int3(0,  1, 0))) { emit_face(params, vertices, draw_args, p, 3u, color); }
-        if (!occupied(block.mask, local_voxel + int3(0, 0, -1))) { emit_face(params, vertices, draw_args, p, 4u, color); }
-        if (!occupied(block.mask, local_voxel + int3(0, 0,  1))) { emit_face(params, vertices, draw_args, p, 5u, color); }
     }
 }

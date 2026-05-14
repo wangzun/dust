@@ -18,10 +18,10 @@ export T getDescriptorFromHandle<T>(DescriptorHandle<T> handle) where T : IOpaqu
     }
 }
 
-struct GeneratedVertex {
-    float4 position;
+struct VisibleCluster {
+    float4 local_min_size;
     float4 color;
-    float4 normal;
+    uint4 meta;
 };
 
 struct RenderParams {
@@ -46,20 +46,89 @@ struct Fragment {
     float4 color;
 };
 
+float3 cube_corner(uint vertex_id)
+{
+    uint corner_id = 0u;
+    uint face = vertex_id / 6u;
+    uint tri = vertex_id % 6u;
+    if (tri == 0u) { corner_id = 0u; }
+    else if (tri == 1u) { corner_id = 1u; }
+    else if (tri == 2u) { corner_id = 2u; }
+    else if (tri == 3u) { corner_id = 0u; }
+    else if (tri == 4u) { corner_id = 2u; }
+    else { corner_id = 3u; }
+
+    if (face == 0u)
+    {
+        float3 corners[4] = { float3(0, 0, 0), float3(0, 0, 1), float3(0, 1, 1), float3(0, 1, 0) };
+        return corners[corner_id];
+    }
+    if (face == 1u)
+    {
+        float3 corners[4] = { float3(1, 0, 0), float3(1, 1, 0), float3(1, 1, 1), float3(1, 0, 1) };
+        return corners[corner_id];
+    }
+    if (face == 2u)
+    {
+        float3 corners[4] = { float3(0, 0, 0), float3(1, 0, 0), float3(1, 0, 1), float3(0, 0, 1) };
+        return corners[corner_id];
+    }
+    if (face == 3u)
+    {
+        float3 corners[4] = { float3(0, 1, 0), float3(0, 1, 1), float3(1, 1, 1), float3(1, 1, 0) };
+        return corners[corner_id];
+    }
+    if (face == 4u)
+    {
+        float3 corners[4] = { float3(0, 0, 0), float3(0, 1, 0), float3(1, 1, 0), float3(1, 0, 0) };
+        return corners[corner_id];
+    }
+    float3 corners[4] = { float3(0, 0, 1), float3(1, 0, 1), float3(1, 1, 1), float3(0, 1, 1) };
+    return corners[corner_id];
+}
+
+float3 cube_normal(uint vertex_id)
+{
+    uint face = vertex_id / 6u;
+    if (face == 0u) { return float3(-1.0, 0.0, 0.0); }
+    if (face == 1u) { return float3( 1.0, 0.0, 0.0); }
+    if (face == 2u) { return float3(0.0, -1.0, 0.0); }
+    if (face == 3u) { return float3(0.0,  1.0, 0.0); }
+    if (face == 4u) { return float3(0.0, 0.0, -1.0); }
+    return float3(0.0, 0.0, 1.0);
+}
+
+float3 transform_position(RenderParams params, float3 position)
+{
+    return float3(
+        dot(params.model_row0.xyz, position) + params.model_row0.w,
+        dot(params.model_row1.xyz, position) + params.model_row1.w,
+        dot(params.model_row2.xyz, position) + params.model_row2.w);
+}
+
+float3 transform_normal(RenderParams params, float3 normal)
+{
+    return normalize(float3(
+        dot(params.model_row0.xyz, normal),
+        dot(params.model_row1.xyz, normal),
+        dot(params.model_row2.xyz, normal)));
+}
+
 [shader("vertex")]
 VertexStageOutput vertexMain(
     uint vertex_id : SV_VertexID,
+    uint instance_id : SV_InstanceID,
     uniform uint32_t params_handle,
     uniform uint32_t params_index,
-    uniform uint32_t vertices_handle,
+    uniform uint32_t clusters_handle,
     uniform uint32_t indirect_handle)
 {
     StructuredBuffer<RenderParams>.Handle params_buffer = (StructuredBuffer<RenderParams>.Handle)params_handle;
-    StructuredBuffer<GeneratedVertex>.Handle vertices = (StructuredBuffer<GeneratedVertex>.Handle)vertices_handle;
-    RenderParams params = params_buffer[params_index];
+    StructuredBuffer<VisibleCluster>.Handle clusters = (StructuredBuffer<VisibleCluster>.Handle)clusters_handle;
+    RenderParams draw_params = params_buffer[params_index];
 
     VertexStageOutput output;
-    if (vertex_id >= params.mesh_params.y)
+    if (vertex_id >= draw_params.mesh_params.x || instance_id >= draw_params.mesh_params.y)
     {
         output.sv_position = float4(2.0, 2.0, 1.0, 1.0);
         output.color = float4(0.0);
@@ -67,9 +136,14 @@ VertexStageOutput vertexMain(
         return output;
     }
 
-    GeneratedVertex vertex = vertices[vertex_id];
+    VisibleCluster cluster = clusters[instance_id];
+    RenderParams params = params_buffer[cluster.meta.x];
+    float3 local_position = cluster.local_min_size.xyz + cube_corner(vertex_id) * cluster.local_min_size.w;
+    float3 world_position = transform_position(params, local_position);
+    float3 world_normal = transform_normal(params, cube_normal(vertex_id));
+
     float3 camera_origin = float3(params.camera_axis_x.w, params.camera_axis_y.w, params.camera_axis_z.w);
-    float3 rel = vertex.position.xyz - camera_origin;
+    float3 rel = world_position - camera_origin;
     float camera_x = dot(rel, params.camera_axis_x.xyz);
     float camera_y = dot(rel, params.camera_axis_y.xyz);
     float forward = dot(rel, -params.camera_axis_z.xyz);
@@ -79,8 +153,8 @@ VertexStageOutput vertexMain(
     if (forward <= near_z)
     {
         output.sv_position = float4(2.0, 2.0, 1.0, 1.0);
-        output.color = vertex.color;
-        output.normal = vertex.normal;
+        output.color = cluster.color;
+        output.normal = float4(world_normal, 0.0);
         return output;
     }
 
@@ -92,8 +166,8 @@ VertexStageOutput vertexMain(
         -camera_y / max(tan_half_fov, 0.0001),
         depth * forward,
         forward);
-    output.color = vertex.color;
-    output.normal = vertex.normal;
+    output.color = cluster.color;
+    output.normal = float4(world_normal, 0.0);
     return output;
 }
 
