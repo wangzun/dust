@@ -8,7 +8,10 @@ use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxModel, VoxPalette};
+use crate::{
+    VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxMaterialParam, VoxMaterialTable,
+    VoxModel, VoxPalette,
+};
 
 enum WorldOrParent<'w, 'q> {
     World(&'w mut World),
@@ -254,6 +257,17 @@ impl AssetLoader for VoxLoader {
                 referenced_instances.len()
             );
 
+            let material_table_entries = material_table_entries(&file.palette, &file.materials);
+            let material_table_handle = load_context.add_labeled_asset("MaterialTable".into(), {
+                let mut material_table =
+                    VoxMaterialTable::from_entries(self.allocator.clone(), &material_table_entries)
+                        .map_err(VoxLoadingError::VulkanError)?;
+                material_table
+                    .register_bindless(&self.heap)
+                    .map_err(VoxLoadingError::VulkanError)?;
+                material_table
+            });
+
             let palette_handle = load_context.add_labeled_asset("Palette".into(), {
                 let mut palette = VoxPalette::from_buffer(unsafe {
                     let arr = std::mem::take(&mut file.palette).into_boxed_slice();
@@ -322,6 +336,7 @@ impl AssetLoader for VoxLoader {
                             geometry,
                             material,
                             palette: palette_handle.clone(),
+                            material_table: material_table_handle.clone(),
                         },
                     )
                 }))
@@ -335,6 +350,7 @@ impl AssetLoader for VoxLoader {
                     geometry: model.geometry.clone(),
                     material: model.material.clone(),
                     palette: model.palette.clone(),
+                    material_table: model.material_table.clone(),
                 });
             }
 
@@ -383,4 +399,71 @@ impl VoxLoader {
 
         (geometry, material)
     }
+}
+
+fn material_table_entries(
+    palette: &[dot_vox::Color],
+    materials: &[dot_vox::Material],
+) -> [VoxMaterialParam; 256] {
+    let mut entries = [VoxMaterialParam::default(); 256];
+    for (index, entry) in entries.iter_mut().enumerate() {
+        if let Some(color) = palette.get(index) {
+            entry.base_color = [
+                color.r as f32 / 255.0,
+                color.g as f32 / 255.0,
+                color.b as f32 / 255.0,
+                1.0,
+            ];
+        }
+    }
+
+    for material in materials {
+        let Some(index) = material_table_index(material.id) else {
+            continue;
+        };
+
+        let material_type = material.properties.get("_type").map(String::as_str);
+        let weight = material_float(material, "_weight")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let metallic = match material_type {
+            Some("_metal") => weight,
+            _ => material_float(material, "_metal").unwrap_or(0.0),
+        }
+        .clamp(0.0, 1.0);
+        let roughness = material_float(material, "_rough")
+            .unwrap_or(entries[index].pbr[1])
+            .clamp(0.04, 1.0);
+        let mut specular = material_float(material, "_spec")
+            .or_else(|| material_float(material, "_sp"))
+            .unwrap_or(entries[index].pbr[2])
+            .clamp(0.0, 1.0);
+        if let Some(ior) = material_float(material, "_ior") {
+            let ior = ior.max(1.0);
+            let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+            specular = (f0 / 0.08).clamp(0.0, 1.0);
+        }
+
+        let emission = match material_type {
+            Some("_emit") => weight.max(material_float(material, "_emit").unwrap_or(0.0)),
+            _ => material_float(material, "_emit").unwrap_or(0.0),
+        };
+        let emission = (emission * material_float(material, "_flux").unwrap_or(1.0)).max(0.0);
+        entries[index].pbr = [metallic, roughness, specular, emission];
+    }
+
+    entries
+}
+
+fn material_float(material: &dot_vox::Material, key: &str) -> Option<f32> {
+    material.properties.get(key)?.parse().ok()
+}
+
+fn material_table_index(material_id: u32) -> Option<usize> {
+    let index = if material_id == 0 {
+        0
+    } else {
+        material_id.checked_sub(1)? as usize
+    };
+    (index < 256).then_some(index)
 }

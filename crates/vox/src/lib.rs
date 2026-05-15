@@ -115,6 +115,23 @@ impl Drop for BindlessBufferHandle {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VoxMaterialParam {
+    pub base_color: [f32; 4],
+    /// metallic, roughness, specular strength, emissive strength.
+    pub pbr: [f32; 4],
+}
+
+impl Default for VoxMaterialParam {
+    fn default() -> Self {
+        Self {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            pbr: [0.0, 0.6, 0.5, 0.0],
+        }
+    }
+}
+
 #[derive(Asset, TypePath)]
 pub struct VoxPalette(ManagedBuffer, Option<BindlessBufferHandle>);
 
@@ -176,6 +193,45 @@ impl VoxPalette {
     }
 }
 
+#[derive(Asset, TypePath)]
+pub struct VoxMaterialTable(ManagedBuffer, Option<BindlessBufferHandle>);
+
+impl VoxMaterialTable {
+    pub(crate) fn from_entries(
+        allocator: Allocator,
+        entries: &[VoxMaterialParam; 256],
+    ) -> VkResult<Self> {
+        let mut buffer = ManagedBuffer::new(
+            allocator,
+            std::mem::size_of_val(entries) as u64,
+            16,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        buffer
+            .as_slice_mut()
+            .copy_from_slice(bytemuck::cast_slice(entries));
+        Ok(Self(buffer, None))
+    }
+
+    pub fn register_bindless(&mut self, heap: &ResourceHeap) -> VkResult<()> {
+        if self.1.is_none() {
+            self.1 = Some(BindlessBufferHandle::new(
+                heap,
+                BufferDescriptor::new(&self.0),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn bindless_handle(&self) -> Option<u32> {
+        self.1.as_ref().map(BindlessBufferHandle::get)
+    }
+
+    pub fn flush(&self, encoder: &mut pumicite::command::CommandEncoder) {
+        self.0.flush(encoder);
+    }
+}
+
 /// Marker component for Vox instances
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
@@ -187,6 +243,7 @@ pub struct VoxModel {
     pub geometry: Handle<VoxGeometry>,
     pub material: Handle<VoxMaterial>,
     pub palette: Handle<VoxPalette>,
+    pub material_table: Handle<VoxMaterialTable>,
 }
 
 #[derive(Bundle, Default)]
@@ -206,6 +263,7 @@ impl Plugin for VoxPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<VoxGeometry>()
             .init_asset::<VoxPalette>()
+            .init_asset::<VoxMaterialTable>()
             .init_asset::<VoxMaterial>()
             .register_type::<VoxInstance>()
             .register_type::<VoxModel>();
@@ -266,9 +324,11 @@ fn sync_buffers_system(
     mut ctx: SubmissionState,
     mut material_events: MessageReader<AssetEvent<VoxMaterial>>,
     mut palette_events: MessageReader<AssetEvent<VoxPalette>>,
+    mut material_table_events: MessageReader<AssetEvent<VoxMaterialTable>>,
 
     materials: Res<Assets<VoxMaterial>>,
     palettes: Res<Assets<VoxPalette>>,
+    material_tables: Res<Assets<VoxMaterialTable>>,
 ) {
     ctx.record(|encoder| {
         for event in material_events.read() {
@@ -285,6 +345,15 @@ fn sync_buffers_system(
                 AssetEvent::Added { id } | AssetEvent::Modified { id } => {
                     let palette = palettes.get(*id).unwrap();
                     palette.flush(encoder);
+                }
+                _ => (),
+            }
+        }
+        for event in material_table_events.read() {
+            match event {
+                AssetEvent::Added { id } | AssetEvent::Modified { id } => {
+                    let material_table = material_tables.get(*id).unwrap();
+                    material_table.flush(encoder);
                 }
                 _ => (),
             }
