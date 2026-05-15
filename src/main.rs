@@ -6,7 +6,7 @@ use bevy::math::Affine3A;
 use bevy::prelude::*;
 use bevy_pumicite::CreateDevice;
 use bevy_pumicite::PumiciteApp;
-use dust_pbr::camera::{Camera as SoftwareCamera, SoftwareVoxelCamera};
+use dust_pbr::camera::{Camera as SoftwareCamera, SoftwareVoxelCamera, SoftwareVoxelPixelArt};
 use dust_vox::{VoxGeometry, VoxModel};
 use pumicite::ash::vk;
 
@@ -49,7 +49,14 @@ fn main() {
             is_active: false,
             ..default()
         },
-        SoftwareCamera::default(),
+        SoftwareCamera {
+            pixel_art: SoftwareVoxelPixelArt {
+                enabled: false,
+                pixel_size: 2.0,
+                outline_strength: 2.0,
+            },
+            ..default()
+        },
         SoftwareVoxelCamera,
         Transform::from_translation(TEAPOT_CAMERA_POSITION).looking_at(TEAPOT_CENTER, Vec3::Y),
         FreeCamera {

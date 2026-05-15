@@ -29,6 +29,33 @@ impl PhysicalCameraParameters {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct SoftwareVoxelPixelArt {
+    pub enabled: bool,
+    pub pixel_size: f32,
+    pub outline_strength: f32,
+}
+
+impl SoftwareVoxelPixelArt {
+    pub const fn off() -> Self {
+        Self {
+            enabled: false,
+            pixel_size: 1.0,
+            outline_strength: 0.0,
+        }
+    }
+}
+
+impl Default for SoftwareVoxelPixelArt {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pixel_size: 3.0,
+            outline_strength: 4.0,
+        }
+    }
+}
+
 #[derive(Component)]
 pub struct Camera {
     pub viewport: Option<Viewport>,
@@ -48,6 +75,8 @@ pub struct Camera {
 
     /// The focal length of the camera in meters.
     pub focal_length: f32,
+
+    pub pixel_art: SoftwareVoxelPixelArt,
 }
 
 #[derive(Component, Default)]
@@ -72,6 +101,7 @@ impl Default for Camera {
             exposure: 10.0,
             sensor_width: 0.036,
             focal_length: 0.035,
+            pixel_art: SoftwareVoxelPixelArt::default(),
         }
     }
 }

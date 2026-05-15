@@ -6,11 +6,13 @@ use bevy::math::Affine3A;
 use bevy::prelude::*;
 use bevy_pumicite::prelude::*;
 use dust_vox::{
-    BindlessBufferHandle, BufferDescriptor, VoxGeometry, VoxMaterial, VoxMaterialTable, VoxModel,
+    BindlessBufferHandle, BufferDescriptor, RuntimeVoxelModelRef, RuntimeVoxelWorld, VoxGeometry,
+    VoxMaterial, VoxMaterialTable, VoxModel,
 };
 use pumicite::{
     Allocator,
-    ash::vk,
+    ash::{VkResult, vk},
+    bindless::{ImageAccessMode, ResourceHeap, SamplerHandle},
     buffer::{Buffer, BufferLike},
     debug::DebugObject,
     image::{FullImageView, Image, ImageExt, ImageLike},
@@ -67,6 +69,7 @@ struct SoftwareVoxelPipeline {
     depth_pyramid: Handle<ComputePipeline>,
     depth_draw: Handle<GraphicsPipeline>,
     draw: Handle<GraphicsPipeline>,
+    post: Handle<GraphicsPipeline>,
 }
 
 #[derive(Resource)]
@@ -81,12 +84,16 @@ struct SoftwareMeshResources {
     params_handle: BindlessBufferHandle,
     depth_pyramid_handle: BindlessBufferHandle,
     previous_depth_pyramid_handle: BindlessBufferHandle,
+    color_handle: BindlessImageHandle,
+    post_sampler: SamplerHandle,
+    color: GPUMutex<FullImageView<Image>>,
     depth: GPUMutex<FullImageView<Image>>,
     cluster_state: ResourceState,
     indirect_state: ResourceState,
     params_state: ResourceState,
     depth_pyramid_state: ResourceState,
     previous_depth_pyramid_state: ResourceState,
+    color_state: ResourceState,
     depth_state: ResourceState,
     extent: UVec2,
     depth_mips: Vec<DepthPyramidMip>,
@@ -99,6 +106,34 @@ struct DepthPyramidMip {
     offset: u32,
     width: u32,
     height: u32,
+}
+
+struct BindlessImageHandle {
+    heap: ResourceHeap,
+    handle: u32,
+}
+
+impl BindlessImageHandle {
+    fn sampled(
+        heap: &ResourceHeap,
+        image: &impl ImageLike,
+        image_layout: vk::ImageLayout,
+    ) -> VkResult<Self> {
+        Ok(Self {
+            heap: heap.clone(),
+            handle: heap.add_image_with_layout(image, image_layout, ImageAccessMode::Sampled)?,
+        })
+    }
+
+    fn get(&self) -> u32 {
+        self.handle
+    }
+}
+
+impl Drop for BindlessImageHandle {
+    fn drop(&mut self) {
+        self.heap.remove(self.handle);
+    }
 }
 
 #[repr(C)]
@@ -135,6 +170,17 @@ struct DepthPyramidPushConstants {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SoftwareVoxelPostPushConstants {
+    color_handle: u32,
+    sampler_handle: u32,
+    extent: [f32; 2],
+    pixel_size: f32,
+    outline_strength: f32,
+    _pad: [u32; 2],
+}
+
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.insert_resource(SoftwareVoxelPipeline {
         mesh: asset_server.load("software_voxel/software_voxel_mesh.comp.pipeline.ron"),
@@ -142,6 +188,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             .load("software_voxel/software_voxel_depth_pyramid.comp.pipeline.ron"),
         depth_draw: asset_server.load("software_voxel/software_voxel_mesh_depth.gfx.pipeline.ron"),
         draw: asset_server.load("software_voxel/software_voxel_mesh.gfx.pipeline.ron"),
+        post: asset_server.load("software_voxel/software_voxel_post.gfx.pipeline.ron"),
     });
 }
 
@@ -242,6 +289,49 @@ fn ensure_mesh_resources(
     )
     .unwrap();
 
+    let color = Image::new_private(
+        allocator.clone(),
+        &vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_SRGB,
+            extent: vk::Extent3D {
+                width: extent.x,
+                height: extent.y,
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_name(c"Software Voxel Post Color");
+    let color_handle = BindlessImageHandle::sampled(
+        resource_heap,
+        &color,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    )
+    .unwrap();
+    let post_sampler = SamplerHandle::new(
+        heap.sampler_heap().clone(),
+        &vk::SamplerCreateInfo {
+            mag_filter: vk::Filter::NEAREST,
+            min_filter: vk::Filter::NEAREST,
+            mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+            address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
     let depth = Image::new_private(
         allocator.clone(),
         &vk::ImageCreateInfo {
@@ -276,6 +366,14 @@ fn ensure_mesh_resources(
         params_handle,
         depth_pyramid_handle,
         previous_depth_pyramid_handle,
+        color_handle,
+        post_sampler,
+        color: GPUMutex::new(
+            color
+                .create_full_view()
+                .unwrap()
+                .with_name(c"Software Voxel Post Color View"),
+        ),
         depth: GPUMutex::new(
             depth
                 .create_full_view()
@@ -287,6 +385,7 @@ fn ensure_mesh_resources(
         params_state: ResourceState::default(),
         depth_pyramid_state: ResourceState::default(),
         previous_depth_pyramid_state: ResourceState::default(),
+        color_state: ResourceState::default(),
         depth_state: ResourceState::default(),
         extent,
         depth_mips,
@@ -305,10 +404,16 @@ fn render(
     mut staging: ResMut<HostVisibleRingBuffer>,
     mut resources: ResMut<SoftwareMeshResources>,
     cameras: Query<(&Camera, &GlobalTransform), With<SoftwareVoxelCamera>>,
-    models: Query<(&VoxModel, Option<&GlobalTransform>, Option<&Transform>)>,
+    models: Query<(
+        &VoxModel,
+        Option<&RuntimeVoxelModelRef>,
+        Option<&GlobalTransform>,
+        Option<&Transform>,
+    )>,
     geometries: Res<Assets<VoxGeometry>>,
     materials: Res<Assets<VoxMaterial>>,
     material_tables: Res<Assets<VoxMaterialTable>>,
+    runtime_world: Option<Res<RuntimeVoxelWorld>>,
     mut bounds_cache: Local<HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>>,
 ) {
     let Ok(mut swapchain_image) = swapchain_image.single_mut() else {
@@ -330,6 +435,15 @@ fn render(
     let Some(draw_pipeline) = graphics_pipelines.get(&pipeline.draw).cloned() else {
         return;
     };
+    let pixel_art = camera.pixel_art;
+    let post_pipeline = if pixel_art.enabled {
+        let Some(post_pipeline) = graphics_pipelines.get(&pipeline.post).cloned() else {
+            return;
+        };
+        Some(post_pipeline)
+    } else {
+        None
+    };
 
     let base_uniform = empty_uniform(camera, camera_transform, resources.extent);
     let previous_depth_valid = resources.previous_depth_valid
@@ -338,14 +452,35 @@ fn render(
             .is_some_and(|axes| previous_depth_camera_matches(axes, base_uniform.camera_axes));
     let mut mesh_uniforms = Vec::new();
     let mut total_blocks = 0u32;
-    for (model, global_transform, local_transform) in models.iter() {
-        let Some(geometry) = geometries.get(&model.geometry) else {
-            continue;
-        };
-        let Some(material) = materials.get(&model.material) else {
-            continue;
-        };
-        let Some(material_table) = material_tables.get(&model.material_table) else {
+    for (model, runtime_ref, global_transform, local_transform) in models.iter() {
+        let runtime_model = runtime_ref.and_then(|runtime_ref| {
+            runtime_world
+                .as_ref()
+                .and_then(|runtime_world| runtime_world.model(runtime_ref.id))
+        });
+        let (geometry, material, material_table_handle, local_bounds) =
+            if let Some(runtime_model) = runtime_model {
+                (
+                    &runtime_model.geometry,
+                    &runtime_model.material,
+                    &runtime_model.material_table,
+                    runtime_model.bounds(),
+                )
+            } else {
+                let Some(geometry) = geometries.get(&model.geometry) else {
+                    continue;
+                };
+                let Some(material) = materials.get(&model.material) else {
+                    continue;
+                };
+                (
+                    geometry,
+                    material,
+                    &model.material_table,
+                    geometry_bounds(&mut bounds_cache, model.geometry.id(), geometry),
+                )
+            };
+        let Some(material_table) = material_tables.get(material_table_handle) else {
             continue;
         };
         let block_count = geometry.tree.pools()[0].used_capacity();
@@ -360,9 +495,7 @@ fn render(
                     .map(Transform::compute_affine)
                     .unwrap_or(Affine3A::IDENTITY)
             });
-        if let Some((local_min, local_max)) =
-            geometry_bounds(&mut bounds_cache, model.geometry.id(), geometry)
-        {
+        if let Some((local_min, local_max)) = local_bounds {
             if !aabb_visible(
                 camera,
                 camera_transform,
@@ -713,91 +846,261 @@ fn render(
 
         encoder.use_resource::<()>(&mut resources.cluster_state, cluster_shader_read);
         encoder.use_resource::<()>(&mut resources.indirect_state, indirect_read);
-        let current_swapchain_image = encoder.lock(
-            current_swapchain_image,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        );
-        encoder.use_image_resource(
-            current_swapchain_image,
-            &mut swapchain_image.state,
-            Access::COLOR_ATTACHMENT_WRITE,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            0..1,
-            0..1,
-            false,
-        );
-        encoder.use_image_resource(
-            depth.image(),
-            &mut resources.depth_state,
-            Access {
-                stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            },
-            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-            0..1,
-            0..1,
-            true,
-        );
-        encoder.emit_barriers();
-
-        let mut pass = encoder
-            .begin_rendering()
-            .color_attachment(0, |mut builder| {
-                builder
-                    .clear(Vec4::new(0.025, 0.03, 0.04, 1.0))
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .store(true)
-                    .view(current_swapchain_image.srgb_view().unwrap());
-            })
-            .depth_attachment(|mut builder| {
-                builder
-                    .clear(1.0)
-                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                    .store(true)
-                    .view(depth);
-            })
-            .render_area(IVec2::ZERO, current_swapchain_image.extent().xy())
-            .begin();
-
-        let draw_pipeline = pass.retain(draw_pipeline.into_inner());
-        heap.bind(&mut pass, vk::PipelineBindPoint::GRAPHICS);
-        pass.bind_pipeline(draw_pipeline);
-        pass.set_viewport(
-            0,
-            &[vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: current_swapchain_image.extent().x as f32,
-                height: current_swapchain_image.extent().y as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }],
-        );
-        pass.set_scissor(
-            0,
-            &[vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: vk::Extent2D {
-                    width: current_swapchain_image.extent().x,
-                    height: current_swapchain_image.extent().y,
+        if pixel_art.enabled {
+            let color = encoder.lock(
+                &resources.color,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            );
+            encoder.use_image_resource(
+                color.image(),
+                &mut resources.color_state,
+                Access::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                0..1,
+                0..1,
+                true,
+            );
+            encoder.use_image_resource(
+                depth.image(),
+                &mut resources.depth_state,
+                Access {
+                    stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 },
-            }],
-        );
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                0..1,
+                0..1,
+                true,
+            );
+            encoder.emit_barriers();
 
-        pass.push_constants(
-            draw_pipeline.layout(),
-            vk::ShaderStageFlags::ALL,
-            0,
-            bytemuck::bytes_of(&SoftwareVoxelPushConstants {
-                params_handle: resources.params_handle.get(),
-                params_index: draw_final_index,
-                clusters_handle: resources.clusters_handle.get(),
-                indirect_handle: resources.indirect_handle.get(),
-            }),
-        );
-        pass.draw_indirect(indirect.as_ref(), 1, INDIRECT_BUFFER_SIZE as u32);
-        pass.end();
+            let mut pass = encoder
+                .begin_rendering()
+                .color_attachment(0, |mut builder| {
+                    builder
+                        .clear(Vec4::new(0.025, 0.03, 0.04, 1.0))
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .store(true)
+                        .view(color);
+                })
+                .depth_attachment(|mut builder| {
+                    builder
+                        .clear(1.0)
+                        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .store(true)
+                        .view(depth);
+                })
+                .render_area(IVec2::ZERO, swapchain_extent.xy())
+                .begin();
+
+            let draw_pipeline = pass.retain(draw_pipeline.into_inner());
+            heap.bind(&mut pass, vk::PipelineBindPoint::GRAPHICS);
+            pass.bind_pipeline(draw_pipeline);
+            pass.set_viewport(
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: swapchain_extent.x as f32,
+                    height: swapchain_extent.y as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            pass.set_scissor(
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: swapchain_extent.x,
+                        height: swapchain_extent.y,
+                    },
+                }],
+            );
+
+            pass.push_constants(
+                draw_pipeline.layout(),
+                vk::ShaderStageFlags::ALL,
+                0,
+                bytemuck::bytes_of(&SoftwareVoxelPushConstants {
+                    params_handle: resources.params_handle.get(),
+                    params_index: draw_final_index,
+                    clusters_handle: resources.clusters_handle.get(),
+                    indirect_handle: resources.indirect_handle.get(),
+                }),
+            );
+            pass.draw_indirect(indirect.as_ref(), 1, INDIRECT_BUFFER_SIZE as u32);
+            pass.end();
+
+            encoder.use_image_resource(
+                color.image(),
+                &mut resources.color_state,
+                Access::FRAGMENT_SAMPLED_READ,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                0..1,
+                0..1,
+                false,
+            );
+            let current_swapchain_image = encoder.lock(
+                current_swapchain_image,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            );
+            encoder.use_image_resource(
+                current_swapchain_image,
+                &mut swapchain_image.state,
+                Access::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                0..1,
+                0..1,
+                false,
+            );
+            encoder.emit_barriers();
+
+            let mut pass = encoder
+                .begin_rendering()
+                .color_attachment(0, |mut builder| {
+                    builder
+                        .clear(Vec4::new(0.025, 0.03, 0.04, 1.0))
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .store(true)
+                        .view(current_swapchain_image.srgb_view().unwrap());
+                })
+                .render_area(IVec2::ZERO, current_swapchain_image.extent().xy())
+                .begin();
+
+            let post_pipeline =
+                post_pipeline.expect("post pipeline is loaded when pixel art is enabled");
+            let post_pipeline = pass.retain(post_pipeline.into_inner());
+            heap.bind(&mut pass, vk::PipelineBindPoint::GRAPHICS);
+            pass.bind_pipeline(post_pipeline);
+            pass.set_viewport(
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: current_swapchain_image.extent().x as f32,
+                    height: current_swapchain_image.extent().y as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            pass.set_scissor(
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: current_swapchain_image.extent().x,
+                        height: current_swapchain_image.extent().y,
+                    },
+                }],
+            );
+            pass.push_constants(
+                post_pipeline.layout(),
+                vk::ShaderStageFlags::ALL,
+                0,
+                bytemuck::bytes_of(&SoftwareVoxelPostPushConstants {
+                    color_handle: resources.color_handle.get(),
+                    sampler_handle: resources.post_sampler.id(),
+                    extent: [
+                        current_swapchain_image.extent().x as f32,
+                        current_swapchain_image.extent().y as f32,
+                    ],
+                    pixel_size: pixel_art.pixel_size,
+                    outline_strength: pixel_art.outline_strength,
+                    _pad: [0; 2],
+                }),
+            );
+            pass.draw(0..3, 0..1);
+            pass.end();
+        } else {
+            let current_swapchain_image = encoder.lock(
+                current_swapchain_image,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            );
+            encoder.use_image_resource(
+                current_swapchain_image,
+                &mut swapchain_image.state,
+                Access::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                0..1,
+                0..1,
+                false,
+            );
+            encoder.use_image_resource(
+                depth.image(),
+                &mut resources.depth_state,
+                Access {
+                    stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                },
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                0..1,
+                0..1,
+                true,
+            );
+            encoder.emit_barriers();
+
+            let mut pass = encoder
+                .begin_rendering()
+                .color_attachment(0, |mut builder| {
+                    builder
+                        .clear(Vec4::new(0.025, 0.03, 0.04, 1.0))
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .store(true)
+                        .view(current_swapchain_image.srgb_view().unwrap());
+                })
+                .depth_attachment(|mut builder| {
+                    builder
+                        .clear(1.0)
+                        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .store(true)
+                        .view(depth);
+                })
+                .render_area(IVec2::ZERO, current_swapchain_image.extent().xy())
+                .begin();
+
+            let draw_pipeline = pass.retain(draw_pipeline.into_inner());
+            heap.bind(&mut pass, vk::PipelineBindPoint::GRAPHICS);
+            pass.bind_pipeline(draw_pipeline);
+            pass.set_viewport(
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: current_swapchain_image.extent().x as f32,
+                    height: current_swapchain_image.extent().y as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            pass.set_scissor(
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: current_swapchain_image.extent().x,
+                        height: current_swapchain_image.extent().y,
+                    },
+                }],
+            );
+
+            pass.push_constants(
+                draw_pipeline.layout(),
+                vk::ShaderStageFlags::ALL,
+                0,
+                bytemuck::bytes_of(&SoftwareVoxelPushConstants {
+                    params_handle: resources.params_handle.get(),
+                    params_index: draw_final_index,
+                    clusters_handle: resources.clusters_handle.get(),
+                    indirect_handle: resources.indirect_handle.get(),
+                }),
+            );
+            pass.draw_indirect(indirect.as_ref(), 1, INDIRECT_BUFFER_SIZE as u32);
+            pass.end();
+        }
 
         encoder.use_resource::<()>(&mut resources.depth_pyramid_state, Access::COPY_READ);
         encoder.use_resource::<()>(

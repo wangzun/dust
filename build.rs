@@ -30,6 +30,11 @@ const SHADERS: &[ShaderTarget<'_>] = &[
             ("depthVertexMain", None),
         ],
     },
+    ShaderTarget {
+        source: "assets/software_voxel/software_voxel_post.slang",
+        output: "assets/software_voxel/software_voxel_post.spv",
+        entries: &[("vertexMain", None), ("fragmentMain", None)],
+    },
 ];
 
 fn main() {

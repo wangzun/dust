@@ -22,8 +22,12 @@ use std::ops::{Deref, DerefMut};
 mod geometry;
 mod loader;
 mod material;
+mod runtime;
 
 pub use material::{VoxLeafNode, VoxMaterial};
+pub use runtime::{
+    RuntimeVoxel, RuntimeVoxelModel, RuntimeVoxelModelId, RuntimeVoxelModelRef, RuntimeVoxelWorld,
+};
 
 /// Leaf node size: 96 bytes
 type TreeRoot = hierarchy!(3, 3, 2, VoxLeafNode);
@@ -267,6 +271,7 @@ impl Plugin for VoxPlugin {
             .init_asset::<VoxMaterial>()
             .register_type::<VoxInstance>()
             .register_type::<VoxModel>();
+        runtime::runtime_voxel_systems(app);
 
         if app
             .world()

@@ -1,0 +1,20 @@
+GraphicsPipeline(
+    shaders: {
+        Vertex: (
+            path: "software_voxel/software_voxel_post.spv",
+            entry_point: "vertexMain",
+        ),
+        Fragment: (
+            path: "software_voxel/software_voxel_post.spv",
+            entry_point: "fragmentMain",
+        ),
+    },
+    layout: Bindless,
+    vertex_bindings: {},
+    attachments: [
+        (
+            blend_enable: false,
+            format: B8G8R8A8_SRGB,
+        )
+    ],
+)
