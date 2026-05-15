@@ -4,7 +4,8 @@ __DynamicResource<__DynamicResourceKind.General> resourceHandles[];
 [[vk::binding(0, 1)]]
 __DynamicResource<__DynamicResourceKind.Sampler> samplerHandles[];
 
-export T getDescriptorFromHandle<T>(DescriptorHandle<T> handle) where T : IOpaqueDescriptor
+export T getDescriptorFromHandle<T>(DescriptorHandle<T> handle)
+    where T : IOpaqueDescriptor
 {
     __target_switch
     {
@@ -18,19 +19,22 @@ export T getDescriptorFromHandle<T>(DescriptorHandle<T> handle) where T : IOpaqu
     }
 }
 
-struct Block {
+struct Block
+{
     uint64_t mask;
     uint coords_packed;
     uint material_ptr;
 };
 
-struct VisibleCluster {
+struct VisibleCluster
+{
     float4 local_min_size;
     float4 color;
     uint4 meta;
 };
 
-struct RenderParams {
+struct RenderParams
+{
     float4 camera_axis_x;
     float4 camera_axis_y;
     float4 camera_axis_z;
@@ -79,9 +83,10 @@ float3 palette_color(RenderParams params, StructuredBuffer<uint32_t>.Handle mate
     uint packed = palette_info[min(palette_index, 255u)];
 
     return float3(
-        float(packed & 255u),
-        float((packed >> 8) & 255u),
-        float((packed >> 16) & 255u)) / 255.0;
+               float(packed & 255u),
+               float((packed >> 8) & 255u),
+               float((packed >> 16) & 255u)) /
+           255.0;
 }
 
 bool block_visible(RenderParams params, float3 local_min, float size)
@@ -115,17 +120,19 @@ bool block_visible(RenderParams params, float3 local_min, float size)
     return true;
 }
 
+static const float32_t distance_lod_thresholds[3] = { 36.0, 110.0, 10000.0 };
+
 uint select_lod_group_size(RenderParams params, float3 local_min)
 {
     float3 world_center = transform_position(params, local_min + float3(2.0));
     float3 camera_origin = float3(params.camera_axis_x.w, params.camera_axis_y.w, params.camera_axis_z.w);
     float distance = length(world_center - camera_origin);
 
-    if (distance < 72.0)
+    if (distance < distance_lod_thresholds[0])
     {
         return 1u;
     }
-    if (distance < 220.0)
+    if (distance < distance_lod_thresholds[1])
     {
         return 2u;
     }
@@ -205,7 +212,7 @@ void emit_group(
 
 [numthreads(64, 1, 1)]
 void meshMain(
-    uint3 dispatch_thread_id : SV_DispatchThreadID,
+    uint3 dispatch_thread_id: SV_DispatchThreadID,
     uniform uint32_t params_handle,
     uniform uint32_t params_index,
     uniform uint32_t clusters_handle,
