@@ -12,7 +12,7 @@ use pumicite::ash::vk;
 
 const TEAPOT_CENTER: Vec3 = Vec3::new(62.5, 30.0, 40.0);
 const TEAPOT_CAMERA_POSITION: Vec3 = Vec3::new(62.5, 35.0, 220.0);
-const SCENE_PATH: &str = "castle.vox";
+const SCENE_PATH: &str = "teapot.vox";
 
 fn main() {
     let mut app = bevy::app::App::new();

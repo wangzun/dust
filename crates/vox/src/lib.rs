@@ -19,6 +19,8 @@ use pumicite::device::DeviceBuilder;
 use pumicite::utils::AsVkHandle;
 use std::ops::{Deref, DerefMut};
 
+use avian3d::prelude::*;
+
 mod geometry;
 mod loader;
 mod material;
@@ -265,6 +267,8 @@ pub struct VoxInstanceBundle {
 pub struct VoxPlugin;
 impl Plugin for VoxPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(PhysicsPlugins::default());
+
         app.init_asset::<VoxGeometry>()
             .init_asset::<VoxPalette>()
             .init_asset::<VoxMaterialTable>()

@@ -8,6 +8,8 @@ use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use avian3d::prelude::*;
+
 use crate::{
     VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxMaterialParam, VoxMaterialTable,
     VoxModel, VoxPalette,
@@ -132,6 +134,20 @@ impl<'a> SceneGraphTraverser<'a> {
                 if model.voxels.len() == 0 {
                     return;
                 }
+                let mut grid_coordinates = vec![];
+                for voxel in model.voxels.iter() {
+                    let voxel = dot_vox::Voxel {
+                        x: voxel.x,
+                        y: voxel.z,
+                        z: (model.size.y - voxel.y as u32 - 1) as u8,
+                        i: voxel.i,
+                    };
+                    grid_coordinates.push(IVec3 {
+                        x: voxel.x as i32,
+                        y: voxel.y as i32,
+                        z: voxel.z as i32,
+                    });
+                }
                 let size = self.scene.models[shape_model.model_id as usize].size;
                 let entity = parent
                     .spawn(VoxInstanceBundle {
@@ -146,6 +162,13 @@ impl<'a> SceneGraphTraverser<'a> {
                         ),
                         ..Default::default()
                     })
+                    .insert((
+                        ColliderConstructor::Voxels {
+                            voxel_size: Vec3::ONE,
+                            grid_coordinates,
+                        },
+                        RigidBody::Dynamic,
+                    ))
                     .id();
                 self.instances.push((shape_model.model_id, entity));
                 self.models.insert(shape_model.model_id);

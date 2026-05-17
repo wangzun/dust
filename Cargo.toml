@@ -13,6 +13,7 @@ dust_pbr = { path = "crates/pbr" }
 dust_app = { path = "crates/app" }
 pumicite = { path = "../pumicite" }
 bevy_pumicite = { path = "../pumicite/crates/bevy" }
+avian3d = { version = "0.6", features = ["serialize"] }
 
 [dependencies]
 dust_vox.workspace = true
@@ -21,6 +22,7 @@ dust_app.workspace = true
 bevy.workspace = true
 pumicite.workspace = true
 bevy_pumicite.workspace = true
+avian3d.workspace = true
 
 [build-dependencies]
 spirv-builder = { path = "../rust-gpu/crates/spirv-builder" }
