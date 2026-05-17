@@ -1,0 +1,34 @@
+[package]
+name = "shaders"
+version = "0.1.0"
+edition = "2024"
+
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(target_arch, values("spirv"))',
+] }
+
+
+[lib]
+crate-type = ["lib", "dylib"]
+
+[dependencies]
+
+# rust-gpu
+spirv-std = { path = "../../../rust-gpu/crates/spirv-std", features = [
+    "bytemuck",
+] }
+
+dst-heap = { path = "../../../rust-gpu/crates/dst_heap" }
+
+glam = { version = "0.32.1", default-features = false, features = [
+    "libm",
+    "bytemuck",
+] }
+bytemuck = "1.23"
+bytemuck_derive = "1.4"
+
+# other
+static_assertions = "1.1.0"
+num_enum = { version = "0.7.2", default-features = false }

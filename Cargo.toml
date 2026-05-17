@@ -22,6 +22,9 @@ bevy.workspace = true
 pumicite.workspace = true
 bevy_pumicite.workspace = true
 
+[build-dependencies]
+spirv-builder = { path = "../rust-gpu/crates/spirv-builder" }
+
 [workspace.dependencies.bevy]
 version = "0.18.1"
 default-features = false
