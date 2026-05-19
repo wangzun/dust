@@ -458,6 +458,14 @@ fn render(
                 .as_ref()
                 .and_then(|runtime_world| runtime_world.model(runtime_ref.id))
         });
+
+        if runtime_model.is_none() {
+            println!(
+                "Runtime model not found for entity with geometry {:?} and material {:?}",
+                model.geometry, model.material
+            )
+        }
+
         let (geometry, material, material_table_handle, local_bounds) =
             if let Some(runtime_model) = runtime_model {
                 (

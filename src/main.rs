@@ -76,7 +76,19 @@ fn main() {
 
 fn startup_system(mut commands: Commands, asset_server: Res<bevy::asset::AssetServer>) {
     let scene: Handle<Scene> = asset_server.load(SCENE_PATH);
-    commands.spawn(SceneRoot(scene));
+    commands.spawn(SceneRoot(scene.clone()));
+    commands.spawn((
+        SceneRoot(scene.clone()),
+        Transform::from_translation(Vec3::new(0.0, 0.0, -90.0)),
+    ));
+    commands.spawn((
+        SceneRoot(scene.clone()),
+        Transform::from_translation(Vec3::new(0.0, 0.0, -180.0)),
+    ));
+    commands.spawn((
+        SceneRoot(scene.clone()),
+        Transform::from_translation(Vec3::new(0.0, 0.0, -270.0)),
+    ));
 }
 
 fn frame_camera_to_loaded_scene(

@@ -25,7 +25,8 @@ bevy_pumicite.workspace = true
 avian3d.workspace = true
 
 [build-dependencies]
-spirv-builder = { path = "../rust-gpu/crates/spirv-builder" }
+# spirv-builder = { path = "../rust-gpu/crates/spirv-builder" }
+spirv-builder = { git = "https://github.com/wangzun/rust-gpu.git" }
 
 [workspace.dependencies.bevy]
 version = "0.18.1"

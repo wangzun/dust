@@ -74,6 +74,15 @@ impl VoxMaterial {
             new_buffer.as_slice_mut()[0..self.buffer.size() as usize]
                 .copy_from_slice(self.buffer.as_slice());
             self.buffer = new_buffer;
+            if let Some(heap) = self
+                .bindless_handle
+                .as_ref()
+                .map(|bindless_handle| bindless_handle.heap.clone())
+            {
+                self.bindless_handle = Some(
+                    BindlessBufferHandle::new(&heap, BufferDescriptor::new(&self.buffer)).unwrap(),
+                );
+            }
         }
     }
 }

@@ -23,11 +23,16 @@ post = []
 [dependencies]
 
 # rust-gpu
-spirv-std = { path = "../../../rust-gpu/crates/spirv-std", features = [
+spirv-std = { git = "https://github.com/wangzun/rust-gpu.git", features = [
     "bytemuck",
 ] }
+# spirv-std = { path = "../../../rust-gpu/crates/spirv-std", features = [
+#     "bytemuck",
+# ] }
 
-dst-heap = { path = "../../../rust-gpu/crates/dst_heap" }
+
+dst-heap = { git = "https://github.com/wangzun/rust-gpu.git" }
+# dst-heap = { path = "../../../rust-gpu/crates/dst_heap" }
 
 glam = { version = "0.32.1", default-features = false, features = [
     "libm",
