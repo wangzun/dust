@@ -13,6 +13,13 @@ unexpected_cfgs = { level = "allow", check-cfg = [
 [lib]
 crate-type = ["lib", "dylib"]
 
+[features]
+default = []
+depth-pyramid = []
+mesh-render = []
+mesh = []
+post = []
+
 [dependencies]
 
 # rust-gpu

@@ -1,54 +1,45 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use spirv_builder::{ModuleResult, SpirvBuilder};
-
-struct ShaderTarget<'a> {
-    source: &'a str,
-    output: &'a str,
-    entries: &'a [(&'a str, Option<&'a str>)],
-}
+use spirv_builder::{Capability, ModuleResult, SpirvBuilder};
 
 struct RustShaderTarget<'a> {
     crate_path: &'a str,
+    feature: &'a str,
     output: &'a str,
+    capabilities: &'a [Capability],
 }
 
-const SHADERS: &[ShaderTarget<'_>] = &[
-    ShaderTarget {
-        source: "assets/software_voxel/software_voxel_mesh.slang",
-        output: "assets/software_voxel/software_voxel_mesh.spv",
-        entries: &[("meshMain", Some("compute"))],
+const RUST_SHADERS: &[RustShaderTarget<'_>] = &[
+    RustShaderTarget {
+        crate_path: "crates/shaders",
+        feature: "depth-pyramid",
+        output: "assets/software_voxel/software_voxel_depth_pyramid.spv",
+        capabilities: &[],
     },
-    ShaderTarget {
-        source: "assets/software_voxel/software_voxel_mesh_render.slang",
+    RustShaderTarget {
+        crate_path: "crates/shaders",
+        feature: "mesh-render",
         output: "assets/software_voxel/software_voxel_mesh_render.spv",
-        entries: &[
-            ("vertexMain", None),
-            ("fragmentMain", None),
-            ("depthVertexMain", None),
-        ],
+        capabilities: &[Capability::DrawParameters],
     },
-    ShaderTarget {
-        source: "assets/software_voxel/software_voxel_post.slang",
+    RustShaderTarget {
+        crate_path: "crates/shaders",
+        feature: "mesh",
+        output: "assets/software_voxel/software_voxel_mesh.spv",
+        capabilities: &[Capability::Int64, Capability::VulkanMemoryModelDeviceScope],
+    },
+    RustShaderTarget {
+        crate_path: "crates/shaders",
+        feature: "post",
         output: "assets/software_voxel/software_voxel_post.spv",
-        entries: &[("vertexMain", None), ("fragmentMain", None)],
+        capabilities: &[Capability::DrawParameters],
     },
 ];
 
-const RUST_SHADERS: &[RustShaderTarget<'_>] = &[RustShaderTarget {
-    crate_path: "crates/shaders",
-    output: "assets/software_voxel/software_voxel_depth_pyramid.spv",
-}];
-
 fn main() {
-    println!("cargo:rerun-if-env-changed=SLANGC");
-    for shader in SHADERS {
-        println!("cargo:rerun-if-changed={}", shader.source);
-    }
     for shader in RUST_SHADERS {
         println!("cargo:rerun-if-changed={}/Cargo.toml", shader.crate_path);
         println!("cargo:rerun-if-changed={}/src", shader.crate_path);
@@ -56,65 +47,25 @@ fn main() {
     println!("cargo:rerun-if-changed=../rust-gpu/crates/dst_heap/src");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let slangc = env::var("SLANGC").unwrap_or_else(|_| "slangc".to_owned());
-
-    for shader in SHADERS {
-        compile_shader(&slangc, &manifest_dir, shader);
-    }
     for shader in RUST_SHADERS {
         compile_rust_shader(&manifest_dir, shader);
     }
 }
 
-fn compile_shader(slangc: &str, manifest_dir: &Path, shader: &ShaderTarget<'_>) {
-    let source = manifest_dir.join(shader.source);
-    let output = manifest_dir.join(shader.output);
-    let mut command = Command::new(slangc);
-    command
-        .arg(&source)
-        .args(["-target", "spirv", "-profile", "sm_6_6"]);
-
-    for (entry, stage) in shader.entries {
-        command.args(["-entry", entry]);
-        if let Some(stage) = stage {
-            command.args(["-stage", stage]);
-        }
-    }
-
-    let output_result = command.arg("-o").arg(&output).output();
-    let output_result = match output_result {
-        Ok(output_result) => output_result,
-        Err(error) => {
-            panic!(
-                "failed to run `{}` while compiling {}: {}",
-                slangc, shader.source, error
-            );
-        }
-    };
-
-    if !output_result.status.success() {
-        panic!(
-            "failed to compile shader {}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            shader.source,
-            output_result.status,
-            String::from_utf8_lossy(&output_result.stdout),
-            String::from_utf8_lossy(&output_result.stderr)
-        );
-    }
-}
-
 fn compile_rust_shader(manifest_dir: &Path, shader: &RustShaderTarget<'_>) {
     let source = manifest_dir.join(shader.crate_path);
-    let output = manifest_dir.join(shader.output);
 
     let mut builder = SpirvBuilder::new(&source, "spirv-unknown-vulkan1.3");
     builder.build_script.defaults = true;
+    builder.capabilities.extend_from_slice(shader.capabilities);
+    builder.shader_crate_features.default_features = false;
+    builder.shader_crate_features.features = vec![shader.feature.to_owned()];
     builder.target_dir_path = Some(PathBuf::from("rust-gpu-shaders"));
 
     let compile_result = builder.build().unwrap_or_else(|error| {
         panic!(
-            "failed to compile rust-gpu shader {}: {}",
-            shader.crate_path, error
+            "failed to compile rust-gpu shader {} with feature {}: {}",
+            shader.crate_path, shader.feature, error
         )
     });
 
@@ -136,6 +87,7 @@ fn compile_rust_shader(manifest_dir: &Path, shader: &RustShaderTarget<'_>) {
         }
     };
 
+    let output = manifest_dir.join(shader.output);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|error| {
             panic!(
