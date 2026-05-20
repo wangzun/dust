@@ -1,0 +1,11 @@
+[package]
+name = "wgpu_backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = { version = "29.0.0", features = [
+    "custom",
+    "wgsl",
+], default-features = false }
+pollster = { version = "0.4", features = ["macro"] }

@@ -6,8 +6,7 @@ use bevy::math::Affine3A;
 use bevy::prelude::*;
 use bevy_pumicite::prelude::*;
 use dust_vox::{
-    BindlessBufferHandle, BufferDescriptor, RuntimeVoxelModelRef, RuntimeVoxelWorld, VoxGeometry,
-    VoxMaterial, VoxMaterialTable, VoxModel,
+    BindlessBufferHandle, BufferDescriptor, VoxGeometry, VoxMaterial, VoxMaterialTable, VoxModel,
 };
 use pumicite::{
     Allocator,
@@ -27,6 +26,7 @@ const MAX_MESH_PARAMS: usize = 4096;
 const VISIBLE_CLUSTER_SIZE: u64 = 48;
 const INDIRECT_BUFFER_SIZE: u64 = std::mem::size_of::<vk::DrawIndirectCommand>() as u64;
 const DEPTH_PYRAMID_TEXEL_SIZE: u64 = 4;
+type BoundsCacheKey = (AssetId<VoxGeometry>, [u32; 3], [u32; 3]);
 
 pub struct PbrRenderPlugin;
 
@@ -144,9 +144,11 @@ struct SoftwareVoxelMeshUniform {
     camera_params: [f32; 4],
     mesh_params: [u32; 4],
     resource_handles: [u32; 4],
+    cull_min: [u32; 4],
+    cull_max: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<SoftwareVoxelMeshUniform>() == 144);
+const _: () = assert!(std::mem::size_of::<SoftwareVoxelMeshUniform>() == 176);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -404,17 +406,11 @@ fn render(
     mut staging: ResMut<HostVisibleRingBuffer>,
     mut resources: ResMut<SoftwareMeshResources>,
     cameras: Query<(&Camera, &GlobalTransform), With<SoftwareVoxelCamera>>,
-    models: Query<(
-        &VoxModel,
-        Option<&RuntimeVoxelModelRef>,
-        Option<&GlobalTransform>,
-        Option<&Transform>,
-    )>,
+    models: Query<(&VoxModel, Option<&GlobalTransform>, Option<&Transform>)>,
     geometries: Res<Assets<VoxGeometry>>,
     materials: Res<Assets<VoxMaterial>>,
     material_tables: Res<Assets<VoxMaterialTable>>,
-    runtime_world: Option<Res<RuntimeVoxelWorld>>,
-    mut bounds_cache: Local<HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>>,
+    mut bounds_cache: Local<HashMap<BoundsCacheKey, Option<(Vec3, Vec3)>>>,
 ) {
     let Ok(mut swapchain_image) = swapchain_image.single_mut() else {
         return;
@@ -452,42 +448,21 @@ fn render(
             .is_some_and(|axes| previous_depth_camera_matches(axes, base_uniform.camera_axes));
     let mut mesh_uniforms = Vec::new();
     let mut total_blocks = 0u32;
-    for (model, runtime_ref, global_transform, local_transform) in models.iter() {
-        let runtime_model = runtime_ref.and_then(|runtime_ref| {
-            runtime_world
-                .as_ref()
-                .and_then(|runtime_world| runtime_world.model(runtime_ref.id))
-        });
-
-        if runtime_model.is_none() {
-            println!(
-                "Runtime model not found for entity with geometry {:?} and material {:?}",
-                model.geometry, model.material
-            )
-        }
-
-        let (geometry, material, material_table_handle, local_bounds) =
-            if let Some(runtime_model) = runtime_model {
-                (
-                    &runtime_model.geometry,
-                    &runtime_model.material,
-                    &runtime_model.material_table,
-                    runtime_model.bounds(),
-                )
-            } else {
-                let Some(geometry) = geometries.get(&model.geometry) else {
-                    continue;
-                };
-                let Some(material) = materials.get(&model.material) else {
-                    continue;
-                };
-                (
-                    geometry,
-                    material,
-                    &model.material_table,
-                    geometry_bounds(&mut bounds_cache, model.geometry.id(), geometry),
-                )
-            };
+    for (model, global_transform, local_transform) in models.iter() {
+        let Some(geometry) = geometries.get(&model.geometry) else {
+            continue;
+        };
+        let Some(material) = materials.get(&model.material) else {
+            continue;
+        };
+        let material_table_handle = &model.material_table;
+        let local_bounds = geometry_bounds(
+            &mut bounds_cache,
+            model.geometry.id(),
+            geometry,
+            model.cull_min,
+            model.cull_max,
+        );
         let Some(material_table) = material_tables.get(material_table_handle) else {
             continue;
         };
@@ -503,18 +478,19 @@ fn render(
                     .map(Transform::compute_affine)
                     .unwrap_or(Affine3A::IDENTITY)
             });
-        if let Some((local_min, local_max)) = local_bounds {
-            if !aabb_visible(
-                camera,
-                camera_transform,
-                resources.extent,
-                affine,
-                geometry.unit_size,
-                local_min,
-                local_max,
-            ) {
-                continue;
-            }
+        let Some((local_min, local_max)) = local_bounds else {
+            continue;
+        };
+        if !aabb_visible(
+            camera,
+            camera_transform,
+            resources.extent,
+            affine,
+            geometry.unit_size,
+            local_min,
+            local_max,
+        ) {
+            continue;
         }
         let mut uniform = base_uniform;
         uniform.model_rows = affine_rows(affine, geometry.unit_size);
@@ -527,6 +503,8 @@ fn render(
             continue;
         };
         uniform.resource_handles = [geometry_handle, material_handle, material_table_handle, 0];
+        uniform.cull_min = [model.cull_min.x, model.cull_min.y, model.cull_min.z, 0];
+        uniform.cull_max = [model.cull_max.x, model.cull_max.y, model.cull_max.z, 0];
         mesh_uniforms.push(uniform);
         total_blocks = total_blocks.saturating_add(block_count);
         if mesh_uniforms.len() + 8 >= MAX_MESH_PARAMS {
@@ -1214,12 +1192,26 @@ fn previous_depth_camera_matches(previous: [[f32; 4]; 3], current: [[f32; 4]; 3]
 }
 
 fn geometry_bounds(
-    cache: &mut HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>,
+    cache: &mut HashMap<BoundsCacheKey, Option<(Vec3, Vec3)>>,
     id: AssetId<VoxGeometry>,
     geometry: &VoxGeometry,
+    cull_min: UVec3,
+    cull_max: UVec3,
 ) -> Option<(Vec3, Vec3)> {
-    *cache.entry(id).or_insert_with(|| {
-        let mut iter = geometry.tree.iter();
+    let key = (
+        id,
+        [cull_min.x, cull_min.y, cull_min.z],
+        [cull_max.x, cull_max.y, cull_max.z],
+    );
+    *cache.entry(key).or_insert_with(|| {
+        if cull_min.cmpge(cull_max).any() {
+            return None;
+        }
+
+        let mut iter = geometry
+            .tree
+            .iter()
+            .filter(|voxel| !voxel.cmplt(cull_min).any() && !voxel.cmpge(cull_max).any());
         let first = iter.next()?;
         let mut min = first;
         let mut max = first;
@@ -1302,6 +1294,8 @@ fn empty_uniform(
         ],
         mesh_params: [0, MAX_VISIBLE_CLUSTERS, 0, 0],
         resource_handles: [0; 4],
+        cull_min: [0; 4],
+        cull_max: [u32::MAX; 4],
     }
 }
 

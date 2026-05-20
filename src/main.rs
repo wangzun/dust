@@ -12,7 +12,7 @@ use pumicite::ash::vk;
 
 const TEAPOT_CENTER: Vec3 = Vec3::new(62.5, 30.0, 40.0);
 const TEAPOT_CAMERA_POSITION: Vec3 = Vec3::new(62.5, 35.0, 220.0);
-const SCENE_PATH: &str = "teapot.vox";
+const SCENE_PATH: &str = "castle.vox";
 
 fn main() {
     let mut app = bevy::app::App::new();
@@ -69,26 +69,33 @@ fn main() {
     ));
 
     app.add_systems(Startup, startup_system.after(CreateDevice));
-    app.add_systems(Update, frame_camera_to_loaded_scene);
+    // app.add_systems(Update, frame_camera_to_loaded_scene);
 
     app.run();
 }
 
 fn startup_system(mut commands: Commands, asset_server: Res<bevy::asset::AssetServer>) {
     let scene: Handle<Scene> = asset_server.load(SCENE_PATH);
-    commands.spawn(SceneRoot(scene.clone()));
-    commands.spawn((
-        SceneRoot(scene.clone()),
-        Transform::from_translation(Vec3::new(0.0, 0.0, -90.0)),
-    ));
-    commands.spawn((
-        SceneRoot(scene.clone()),
-        Transform::from_translation(Vec3::new(0.0, 0.0, -180.0)),
-    ));
-    commands.spawn((
-        SceneRoot(scene.clone()),
-        Transform::from_translation(Vec3::new(0.0, 0.0, -270.0)),
-    ));
+    // spawn 100 scene on a plane to test
+    for i in 0..100 {
+        commands.spawn((
+            SceneRoot(scene.clone()),
+            Transform::from_translation(Vec3::new(0.0, 0.0, -900.0 * i as f32)),
+        ));
+    }
+    // commands.spawn(SceneRoot(scene.clone()));
+    // commands.spawn((
+    //     SceneRoot(scene.clone()),
+    //     Transform::from_translation(Vec3::new(0.0, 0.0, -90.0)),
+    // ));
+    // commands.spawn((
+    //     SceneRoot(scene.clone()),
+    //     Transform::from_translation(Vec3::new(0.0, 0.0, -180.0)),
+    // ));
+    // commands.spawn((
+    //     SceneRoot(scene.clone()),
+    //     Transform::from_translation(Vec3::new(0.0, 0.0, -270.0)),
+    // ));
 }
 
 fn frame_camera_to_loaded_scene(

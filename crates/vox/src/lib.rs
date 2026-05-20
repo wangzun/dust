@@ -24,12 +24,8 @@ use avian3d::prelude::*;
 mod geometry;
 mod loader;
 mod material;
-mod runtime;
 
 pub use material::{VoxLeafNode, VoxMaterial};
-pub use runtime::{
-    RuntimeVoxel, RuntimeVoxelModel, RuntimeVoxelModelId, RuntimeVoxelModelRef, RuntimeVoxelWorld,
-};
 
 /// Leaf node size: 96 bytes
 type TreeRoot = hierarchy!(3, 3, 2, VoxLeafNode);
@@ -250,11 +246,8 @@ pub struct VoxModel {
     pub material: Handle<VoxMaterial>,
     pub palette: Handle<VoxPalette>,
     pub material_table: Handle<VoxMaterialTable>,
-}
-
-#[derive(Bundle, Default)]
-pub struct VoxModelBundle {
-    pub model: VoxModel,
+    pub cull_min: UVec3,
+    pub cull_max: UVec3,
 }
 
 #[derive(Bundle, Default)]
@@ -275,7 +268,6 @@ impl Plugin for VoxPlugin {
             .init_asset::<VoxMaterial>()
             .register_type::<VoxInstance>()
             .register_type::<VoxModel>();
-        runtime::runtime_voxel_systems(app);
 
         if app
             .world()

@@ -44,6 +44,8 @@ pub struct RenderParams {
     pub camera_params: Vec4,
     pub mesh_params: UVec4,
     pub resource_handles: UVec4,
+    pub cull_min: UVec4,
+    pub cull_max: UVec4,
 }
 
 #[repr(C)]
@@ -73,6 +75,49 @@ fn voxel_id(voxel: UVec3) -> u32 {
 
 fn occupied(mask: u64, voxel: UVec3) -> bool {
     ((mask >> voxel_id(voxel)) & 1) != 0
+}
+
+fn cull_min(params: RenderParams) -> UVec3 {
+    UVec3::new(params.cull_min.x, params.cull_min.y, params.cull_min.z)
+}
+
+fn cull_max(params: RenderParams) -> UVec3 {
+    UVec3::new(params.cull_max.x, params.cull_max.y, params.cull_max.z)
+}
+
+fn voxel_in_cull_range(params: RenderParams, voxel: UVec3) -> bool {
+    let min = cull_min(params);
+    let max = cull_max(params);
+    voxel.x >= min.x
+        && voxel.y >= min.y
+        && voxel.z >= min.z
+        && voxel.x < max.x
+        && voxel.y < max.y
+        && voxel.z < max.z
+}
+
+fn range_intersects_cull(params: RenderParams, min: UVec3, size: u32) -> bool {
+    let max = min + UVec3::splat(size);
+    let cull_min = cull_min(params);
+    let cull_max = cull_max(params);
+    max.x > cull_min.x
+        && max.y > cull_min.y
+        && max.z > cull_min.z
+        && min.x < cull_max.x
+        && min.y < cull_max.y
+        && min.z < cull_max.z
+}
+
+fn range_contained_by_cull(params: RenderParams, min: UVec3, size: u32) -> bool {
+    let max = min + UVec3::splat(size);
+    let cull_min = cull_min(params);
+    let cull_max = cull_max(params);
+    min.x >= cull_min.x
+        && min.y >= cull_min.y
+        && min.z >= cull_min.z
+        && max.x <= cull_max.x
+        && max.y <= cull_max.y
+        && max.z <= cull_max.z
 }
 
 fn transform_position(params: RenderParams, position: Vec3) -> Vec3 {
@@ -121,18 +166,13 @@ fn block_visible(params: RenderParams, local_min: Vec3, size: f32) -> bool {
     let camera_y = rel.dot(params.camera_axis_y.truncate());
     let forward = rel.dot(-params.camera_axis_z.truncate());
 
-    let radius = params
-        .model_row0
-        .truncate()
-        .length()
-        .max(
-            params
-                .model_row1
-                .truncate()
-                .length()
-                .max(params.model_row2.truncate().length()),
-        )
-        * size
+    let radius = params.model_row0.truncate().length().max(
+        params
+            .model_row1
+            .truncate()
+            .length()
+            .max(params.model_row2.truncate().length()),
+    ) * size
         * 0.9;
     let near_z = params.camera_params.z;
     let far_z = params.camera_params.w;
@@ -185,7 +225,12 @@ fn mip_offset(base_width: u32, base_height: u32, mip: u32) -> u32 {
     offset
 }
 
-fn cluster_occluded(control: RenderParams, params: RenderParams, local_min: Vec3, size: f32) -> bool {
+fn cluster_occluded(
+    control: RenderParams,
+    params: RenderParams,
+    local_min: Vec3,
+    size: f32,
+) -> bool {
     let pyramid_handle = control.resource_handles.x;
     let pyramid_width = control.resource_handles.y;
     let pyramid_height = control.resource_handles.z;
@@ -225,8 +270,9 @@ fn cluster_occluded(control: RenderParams, params: RenderParams, local_min: Vec3
 
     screen_min = screen_min.clamp(Vec2::ZERO, Vec2::ONE);
     screen_max = screen_max.clamp(Vec2::ZERO, Vec2::ONE);
-    let rect_pixels = ((screen_max - screen_min) * Vec2::new(pyramid_width as f32, pyramid_height as f32))
-        .max(Vec2::ONE);
+    let rect_pixels = ((screen_max - screen_min)
+        * Vec2::new(pyramid_width as f32, pyramid_height as f32))
+    .max(Vec2::ONE);
     let mip_float = (rect_pixels.x.max(rect_pixels.y).log2().floor() - 1.0).max(0.0);
     let mip = (mip_float as u32).min(mip_count - 1);
     let mip_width = (pyramid_width >> mip).max(1);
@@ -274,9 +320,8 @@ fn emit_cluster(
     color: Vec4,
     packed_pbr: u32,
 ) {
-    let cluster_index = unsafe {
-        atomic_i_add::<u32, { Scope::Device as u32 }, 0>(&mut draw_args[1], 1)
-    };
+    let cluster_index =
+        unsafe { atomic_i_add::<u32, { Scope::Device as u32 }, 0>(&mut draw_args[1], 1) };
     if cluster_index >= params.mesh_params.y {
         return;
     }
@@ -302,6 +347,11 @@ fn emit_group(
     group_size: u32,
     occlusion_enabled: bool,
 ) {
+    let group_min = block_origin + group_origin;
+    if !range_intersects_cull(params, group_min, group_size) {
+        return;
+    }
+
     let mut color_sum = Vec4::ZERO;
     let mut pbr_sum = Vec4::ZERO;
     let mut color_count = 0;
@@ -313,7 +363,11 @@ fn emit_group(
             let mut z = 0;
             while z < group_size {
                 let local_voxel = group_origin + UVec3::new(x, y, z);
-                if !local_voxel.cmpge(UVec3::splat(4)).any() && occupied(block.mask, local_voxel) {
+                let voxel = block_origin + local_voxel;
+                if !local_voxel.cmpge(UVec3::splat(4)).any()
+                    && voxel_in_cull_range(params, voxel)
+                    && occupied(block.mask, local_voxel)
+                {
                     let material =
                         voxel_material(material_info, material_table, block, voxel_id(local_voxel));
                     color_sum += material.base_color;
@@ -332,7 +386,7 @@ fn emit_group(
     }
 
     let size = group_size as f32;
-    let local_min = (block_origin + group_origin).as_vec3();
+    let local_min = group_min.as_vec3();
     if !block_visible(params, local_min, size) {
         return;
     }
@@ -423,7 +477,14 @@ pub fn mesh_main(
     }
 
     let block_origin = unpack_block_coords(block.coords_packed);
-    let group_size = select_lod_group_size(params, block_origin.as_vec3());
+    if !range_intersects_cull(params, block_origin, 4) {
+        return;
+    }
+
+    let mut group_size = select_lod_group_size(params, block_origin.as_vec3());
+    if !range_contained_by_cull(params, block_origin, 4) {
+        group_size = 1;
+    }
     let occlusion_enabled = mode == 4 || mode == 5;
     let mut x = 0;
     while x < 4 {

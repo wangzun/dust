@@ -27,6 +27,8 @@ pub struct RenderParams {
     pub camera_params: Vec4,
     pub mesh_params: UVec4,
     pub resource_handles: UVec4,
+    pub cull_min: UVec4,
+    pub cull_max: UVec4,
 }
 
 #[repr(C)]

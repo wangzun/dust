@@ -1,9 +1,8 @@
 use std::{any::Any, sync::Arc};
 
-use crate::{BindlessBufferHandle, BufferDescriptor, RuntimeVoxel, Tree, VoxMaterial};
+use crate::{BindlessBufferHandle, BufferDescriptor, Tree};
 use bevy::prelude::*;
 use dust_vdb::pool::PoolStorage;
-use dust_vdb::{Attributes, IsLeaf};
 use pumicite::{
     Allocator,
     ash::{VkResult, vk},
@@ -15,9 +14,9 @@ use pumicite::{
 #[derive(Asset, TypePath)]
 pub struct VoxGeometry {
     pub tree: Tree,
-
-    /// Model space size of each voxel
+    // Model space size of each voxel
     pub unit_size: f32,
+
     bindless_handle: Option<BindlessBufferHandle>,
 }
 
@@ -29,6 +28,7 @@ pub struct VoxGeometryLeafStorage {
     alignment: usize,
     size: usize,
 }
+
 impl VoxGeometryLeafStorage {
     pub fn new(allocator: Allocator, alignment: usize) -> Self {
         Self {
@@ -107,27 +107,6 @@ impl VoxGeometry {
 
     pub fn bindless_handle(&self) -> Option<u32> {
         self.bindless_handle.as_ref().map(BindlessBufferHandle::get)
-    }
-
-    pub fn export_voxels(&self, material: &VoxMaterial) -> Vec<RuntimeVoxel> {
-        let mut voxels = Vec::new();
-        for (leaf_origin, leaf) in self.tree.iter_leaf() {
-            let material_count = leaf.get_occupancy().count_ones() as u32;
-            let attributes = material.get_attributes(leaf.get_value(), material_count);
-            for (attribute_index, local_index) in leaf.get_occupancy().iter_ones().enumerate() {
-                let local_index = local_index as u32;
-                let local = UVec3::new(
-                    (local_index >> 4) & 3,
-                    (local_index >> 2) & 3,
-                    local_index & 3,
-                );
-                voxels.push(RuntimeVoxel {
-                    coords: leaf_origin + local,
-                    material: attributes[attribute_index],
-                });
-            }
-        }
-        voxels
     }
 
     fn storage_buffer(&self) -> Option<Arc<Buffer>> {
