@@ -11,14 +11,6 @@ use spirv_std::{
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Block {
-    pub mask: u64,
-    pub coords_packed: u32,
-    pub material_ptr: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 pub struct VisibleCluster {
     pub local_min_size: Vec4,
     pub color: Vec4,
@@ -27,7 +19,7 @@ pub struct VisibleCluster {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct VoxMaterialParams {
+pub struct MaterialParams {
     pub base_color: Vec4,
     pub pbr: Vec4,
 }
@@ -57,24 +49,39 @@ pub struct MeshPushConstants {
     pub indirect_handle: u32,
 }
 
+const DENSE_MATERIAL_PAGE_FLAG: u32 = 0x8000_0000;
+const DENSE_MATERIAL_PAGE_MASK: u32 = !DENSE_MATERIAL_PAGE_FLAG;
+const DENSE_EMPTY_MATERIAL_REF: u32 = u32::MAX;
 fn saturate(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
-fn unpack_block_coords(packed: u32) -> UVec3 {
-    UVec3::new((packed >> 20) & 1023, (packed >> 10) & 1023, packed & 1023) << 2
-}
-
-fn popcount64(value: u64) -> u32 {
-    value.count_ones()
-}
-
 fn voxel_id(voxel: UVec3) -> u32 {
-    (voxel.x << 4) | (voxel.y << 2) | voxel.z
+    voxel.x | (voxel.y << 2) | (voxel.z << 4)
 }
 
 fn occupied(mask: u64, voxel: UVec3) -> bool {
     ((mask >> voxel_id(voxel)) & 1) != 0
+}
+
+fn unpack_dense_size(packed: u32) -> UVec3 {
+    UVec3::new(
+        (packed & 1023) + 1,
+        ((packed >> 10) & 1023) + 1,
+        ((packed >> 20) & 1023) + 1,
+    )
+}
+
+fn dense_block_coords(index: u32, block_extent: UVec3) -> UVec3 {
+    let x = index % block_extent.x;
+    let yz = index / block_extent.x;
+    let y = yz % block_extent.y;
+    let z = yz / block_extent.y;
+    UVec3::new(x, y, z)
+}
+
+fn dense_storage_block_index(block: UVec3, block_extent: UVec3) -> u32 {
+    block.z * block_extent.x * block_extent.y + block.y * block_extent.x + block.x
 }
 
 fn cull_min(params: RenderParams) -> UVec3 {
@@ -128,17 +135,28 @@ fn transform_position(params: RenderParams, position: Vec3) -> Vec3 {
     )
 }
 
-fn voxel_material(
-    material_info: &mut TypedBuffer<[u32]>,
-    material_table: &mut TypedBuffer<[VoxMaterialParams]>,
-    block: Block,
-    hit_voxel_id: u32,
-) -> VoxMaterialParams {
-    let before_mask = block.mask & ((1u64 << hit_voxel_id) - 1);
-    let material_offset = block.material_ptr + popcount64(before_mask);
-    let material_word = material_info[(material_offset >> 2) as usize];
-    let palette_index = (material_word >> ((material_offset & 3) * 8)) & 255;
-    material_table[palette_index.min(255) as usize]
+fn dense_material_id(
+    material_pages: &mut TypedBuffer<[u8]>,
+    material_ref: u32,
+    local_voxel: UVec3,
+) -> u32 {
+    if material_ref == DENSE_EMPTY_MATERIAL_REF {
+        return 0;
+    }
+
+    if (material_ref & DENSE_MATERIAL_PAGE_FLAG) == 0 {
+        return material_ref & 255;
+    }
+
+    let page_index = material_ref & DENSE_MATERIAL_PAGE_MASK;
+    material_pages[(page_index * 64 + voxel_id(local_voxel)) as usize] as u32
+}
+
+fn dense_material(
+    material_table: &mut TypedBuffer<[MaterialParams]>,
+    material_id: u32,
+) -> MaterialParams {
+    material_table[material_id.min(255) as usize]
 }
 
 fn pack_unorm8(value: f32) -> u32 {
@@ -305,8 +323,12 @@ fn select_lod_group_size(params: RenderParams, local_min: Vec3) -> u32 {
         1
     } else if distance < 880.0 {
         2
-    } else {
+    } else if distance < 1760.0 {
         4
+    } else if distance < 3520.0 {
+        8
+    } else {
+        16
     }
 }
 
@@ -333,21 +355,22 @@ fn emit_cluster(
     };
 }
 
-fn emit_group(
+fn emit_dense_group(
     control: RenderParams,
     params: RenderParams,
     clusters: &mut TypedBuffer<[VisibleCluster]>,
     draw_args: &mut TypedBuffer<[u32]>,
-    material_info: &mut TypedBuffer<[u32]>,
-    material_table: &mut TypedBuffer<[VoxMaterialParams]>,
-    block: Block,
+    occupancy_info: &mut TypedBuffer<[u64]>,
+    material_refs: &mut TypedBuffer<[u32]>,
+    material_pages: &mut TypedBuffer<[u8]>,
+    material_table: &mut TypedBuffer<[MaterialParams]>,
     params_index: u32,
-    block_origin: UVec3,
-    group_origin: UVec3,
+    dense_size: UVec3,
+    block_extent: UVec3,
+    group_min: UVec3,
     group_size: u32,
     occlusion_enabled: bool,
 ) {
-    let group_min = block_origin + group_origin;
     if !range_intersects_cull(params, group_min, group_size) {
         return;
     }
@@ -362,14 +385,19 @@ fn emit_group(
         while y < group_size {
             let mut z = 0;
             while z < group_size {
-                let local_voxel = group_origin + UVec3::new(x, y, z);
-                let voxel = block_origin + local_voxel;
-                if !local_voxel.cmpge(UVec3::splat(4)).any()
-                    && voxel_in_cull_range(params, voxel)
-                    && occupied(block.mask, local_voxel)
-                {
-                    let material =
-                        voxel_material(material_info, material_table, block, voxel_id(local_voxel));
+                let voxel = group_min + UVec3::new(x, y, z);
+                if !voxel.cmpge(dense_size).any() && voxel_in_cull_range(params, voxel) {
+                    let block = voxel / UVec3::splat(4);
+                    let local_voxel = UVec3::new(voxel.x & 3, voxel.y & 3, voxel.z & 3);
+                    let block_index = dense_storage_block_index(block, block_extent);
+                    let occupancy = occupancy_info[block_index as usize];
+                    if !occupied(occupancy, local_voxel) {
+                        z += 1;
+                        continue;
+                    }
+                    let material_ref = material_refs[block_index as usize];
+                    let material_id = dense_material_id(material_pages, material_ref, local_voxel);
+                    let material = dense_material(material_table, material_id);
                     color_sum += material.base_color;
                     pbr_sum += material.pbr;
                     color_count += 1;
@@ -466,50 +494,81 @@ pub fn mesh_main(
     }
     let local_block_index = global_block_index - block_base;
 
-    let geometry_info = dst_heap::storage_buffer_from_u32::<Block>(params.resource_handles.x);
-    let material_info = dst_heap::storage_buffer_from_u32::<u32>(params.resource_handles.y);
-    let material_table =
-        dst_heap::storage_buffer_from_u32::<VoxMaterialParams>(params.resource_handles.z);
-
-    let block = geometry_info[local_block_index as usize];
-    if block.mask == 0 {
-        return;
-    }
-
-    let block_origin = unpack_block_coords(block.coords_packed);
-    if !range_intersects_cull(params, block_origin, 4) {
-        return;
-    }
+    let dense_size = unpack_dense_size(params.resource_handles.w);
+    let block_extent = (dense_size + UVec3::splat(3)) / UVec3::splat(4);
+    let block = dense_block_coords(local_block_index, block_extent);
+    let block_origin = block * UVec3::splat(4);
+    let storage_block_index = dense_storage_block_index(block, block_extent);
+    let occupancy_info = dst_heap::storage_buffer_from_u32::<u64>(params.resource_handles.x);
+    let material_refs = dst_heap::storage_buffer_from_u32::<u32>(params.resource_handles.y);
+    let material_pages = dst_heap::storage_buffer_from_u32::<u8>(params.resource_handles.z);
+    let material_table = dst_heap::storage_buffer_from_u32::<MaterialParams>(params.cull_min.w);
 
     let mut group_size = select_lod_group_size(params, block_origin.as_vec3());
-    if !range_contained_by_cull(params, block_origin, 4) {
+    let coarse_group_min = (block_origin / UVec3::splat(group_size)) * UVec3::splat(group_size);
+    if !range_contained_by_cull(params, coarse_group_min, group_size) {
         group_size = 1;
     }
+
     let occlusion_enabled = mode == 4 || mode == 5;
-    let mut x = 0;
-    while x < 4 {
-        let mut y = 0;
-        while y < 4 {
-            let mut z = 0;
-            while z < 4 {
-                emit_group(
-                    control,
-                    params,
-                    clusters,
-                    draw_args,
-                    material_info,
-                    material_table,
-                    block,
-                    instance_param_index,
-                    block_origin,
-                    UVec3::new(x, y, z),
-                    group_size,
-                    occlusion_enabled,
-                );
-                z += group_size;
-            }
-            y += group_size;
+    if group_size <= 4 {
+        let occupancy = occupancy_info[storage_block_index as usize];
+        if occupancy == 0 {
+            return;
         }
-        x += group_size;
+        if !range_intersects_cull(params, block_origin, 4) {
+            return;
+        }
+
+        let mut x = 0;
+        while x < 4 {
+            let mut y = 0;
+            while y < 4 {
+                let mut z = 0;
+                while z < 4 {
+                    emit_dense_group(
+                        control,
+                        params,
+                        clusters,
+                        draw_args,
+                        occupancy_info,
+                        material_refs,
+                        material_pages,
+                        material_table,
+                        instance_param_index,
+                        dense_size,
+                        block_extent,
+                        block_origin + UVec3::new(x, y, z),
+                        group_size,
+                        occlusion_enabled,
+                    );
+                    z += group_size;
+                }
+                y += group_size;
+            }
+            x += group_size;
+        }
+        return;
     }
+
+    let group_min = (block_origin / UVec3::splat(group_size)) * UVec3::splat(group_size);
+    if group_min != block_origin {
+        return;
+    }
+    emit_dense_group(
+        control,
+        params,
+        clusters,
+        draw_args,
+        occupancy_info,
+        material_refs,
+        material_pages,
+        material_table,
+        instance_param_index,
+        dense_size,
+        block_extent,
+        group_min,
+        group_size,
+        occlusion_enabled,
+    );
 }

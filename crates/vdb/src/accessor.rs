@@ -56,7 +56,8 @@ where
         );
         self.last_coords = coords;
         let leaf_node = if lca_level >= ROOT::LEVEL as u32 {
-            self.tree.root.get(&self.tree.pool, coords, &mut self.ptrs)
+            let (root, pools) = self.tree.root_and_pools();
+            root.get(pools, coords, &mut self.ptrs)
         } else {
             let meta = &self.metas[lca_level as usize];
             let new_coords = coords & meta.extent_mask;
@@ -98,12 +99,8 @@ where
         );
         self.last_coords = coords;
         let leaf_node = if lca_level >= ROOT::LEVEL as u32 {
-            self.tree.root.set(
-                &mut self.tree.pool,
-                coords,
-                !value.is_default(),
-                &mut self.ptrs,
-            )
+            let (root, pools) = self.tree.root_mut_and_pools_mut();
+            root.set(pools, coords, !value.is_default(), &mut self.ptrs)
         } else {
             let meta = &self.metas[lca_level as usize];
             let new_coords = coords & meta.extent_mask;

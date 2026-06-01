@@ -17,7 +17,7 @@ pub struct VoxGeometry {
     // Model space size of each voxel
     pub unit_size: f32,
 
-    bindless_handle: Option<BindlessBufferHandle>,
+    bindless_handles: Vec<Option<BindlessBufferHandle>>,
 }
 
 pub struct VoxGeometryLeafStorage {
@@ -80,24 +80,33 @@ impl PoolStorage for VoxGeometryLeafStorage {
 
 impl VoxGeometry {
     pub fn new(allocator: Allocator, unit_size: f32) -> Self {
-        let tree = crate::Tree::new_with_leaf_storage(Box::new(VoxGeometryLeafStorage::new(
-            allocator,
-            crate::Tree::metas()[0].layout.align(),
-        )));
+        let tree = crate::Tree::new_with_all_node_storage(|_level, layout| {
+            Box::new(VoxGeometryLeafStorage::new(
+                allocator.clone(),
+                layout.align(),
+            ))
+        });
 
         Self {
             tree,
             unit_size,
-            bindless_handle: None,
+            bindless_handles: Vec::new(),
         }
     }
 
     pub fn register_bindless(&mut self, heap: &ResourceHeap) -> VkResult<()> {
-        if self.bindless_handle.is_none() {
-            let Some(buffer) = self.storage_buffer() else {
-                return Ok(());
+        let level_count = self.tree.pools().len() + 1;
+        self.bindless_handles.resize_with(level_count, || None);
+
+        for level in 0..level_count {
+            if self.bindless_handles[level].is_some() {
+                continue;
+            }
+
+            let Some(buffer) = self.storage_buffer(level) else {
+                continue;
             };
-            self.bindless_handle = Some(BindlessBufferHandle::new(
+            self.bindless_handles[level] = Some(BindlessBufferHandle::new(
                 heap,
                 BufferDescriptor::new(buffer.as_ref()),
             )?);
@@ -106,12 +115,37 @@ impl VoxGeometry {
     }
 
     pub fn bindless_handle(&self) -> Option<u32> {
-        self.bindless_handle.as_ref().map(BindlessBufferHandle::get)
+        self.bindless_handle_for_level(0)
     }
 
-    fn storage_buffer(&self) -> Option<Arc<Buffer>> {
-        self.tree.pools()[0]
-            .storage()
+    pub fn bindless_handle_for_level(&self, level: usize) -> Option<u32> {
+        self.bindless_handles
+            .get(level)?
+            .as_ref()
+            .map(BindlessBufferHandle::get)
+    }
+
+    pub fn bindless_handles(&self) -> Vec<Option<u32>> {
+        self.bindless_handles
+            .iter()
+            .map(|handle| handle.as_ref().map(BindlessBufferHandle::get))
+            .collect()
+    }
+
+    fn storage_buffer(&self, level: usize) -> Option<Arc<Buffer>> {
+        if level < self.tree.pools().len() {
+            return Self::storage_buffer_from_storage(self.tree.pools()[level].storage());
+        }
+
+        if level == self.tree.pools().len() {
+            return Self::storage_buffer_from_storage(self.tree.root_storage()?);
+        }
+
+        None
+    }
+
+    fn storage_buffer_from_storage(storage: &dyn PoolStorage) -> Option<Arc<Buffer>> {
+        storage
             .as_any()
             .downcast_ref::<VoxGeometryLeafStorage>()?
             .buffer

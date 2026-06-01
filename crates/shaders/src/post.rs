@@ -91,10 +91,7 @@ pub fn vertex_main(
     #[spirv(position)] out_position: &mut Vec4,
 ) {
     let vertex_id = vertex_index.wrapping_sub(base_vertex);
-    let uv = Vec2::new(
-        ((vertex_id << 1) & 2) as f32,
-        (vertex_id & 2) as f32,
-    );
+    let uv = Vec2::new(((vertex_id << 1) & 2) as f32, (vertex_id & 2) as f32);
 
     *out_uv = uv;
     *out_position = Vec4::new(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 0.0, 1.0);

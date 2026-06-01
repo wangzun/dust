@@ -23,13 +23,21 @@ const RUST_SHADERS: &[RustShaderTarget<'_>] = &[
         crate_path: "crates/shaders",
         feature: "mesh-render",
         output: "assets/software_voxel/software_voxel_mesh_render.spv",
-        capabilities: &[Capability::DrawParameters],
+        capabilities: &[
+            Capability::DrawParameters,
+            Capability::Int8,
+            Capability::Int64,
+        ],
     },
     RustShaderTarget {
         crate_path: "crates/shaders",
         feature: "mesh",
         output: "assets/software_voxel/software_voxel_mesh.spv",
-        capabilities: &[Capability::Int64, Capability::VulkanMemoryModelDeviceScope],
+        capabilities: &[
+            Capability::Int8,
+            Capability::Int64,
+            Capability::VulkanMemoryModelDeviceScope,
+        ],
     },
     RustShaderTarget {
         crate_path: "crates/shaders",

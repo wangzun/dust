@@ -1,16 +1,19 @@
 #![feature(generic_const_exprs)]
 
+use avian3d::collider_tree::{ColliderTreeType, ColliderTrees};
 use bevy::math::U8Vec4;
 use bevy::prelude::*;
 use bevy::reflect::Reflect;
 use bevy::{
-    asset::{Asset, Handle},
+    asset::Asset,
     ecs::{bundle::Bundle, component::Component},
     reflect::TypePath,
     transform::components::{GlobalTransform, Transform},
 };
 use bevy_pumicite::{CreateDevice, DefaultTransferSet, DescriptorHeap, SubmissionState};
+use dust_dense::{DenseVoxelGeometry, DenseVoxelMaterial, DenseVoxelModel};
 use dust_vdb::hierarchy;
+use obvhs::cwbvh::bvh2_to_cwbvh::bvh2_to_cwbvh;
 use pumicite::Allocator;
 use pumicite::ash::{VkResult, vk};
 use pumicite::bindless::{BufferAccessMode, ResourceHeap};
@@ -18,8 +21,6 @@ use pumicite::buffer::{BufferLike, ManagedBuffer};
 use pumicite::device::DeviceBuilder;
 use pumicite::utils::AsVkHandle;
 use std::ops::{Deref, DerefMut};
-
-use avian3d::prelude::*;
 
 mod geometry;
 mod loader;
@@ -239,17 +240,6 @@ impl VoxMaterialTable {
 #[reflect(Component)]
 pub struct VoxInstance;
 
-#[derive(Component, Default, Reflect)]
-#[reflect(Component)]
-pub struct VoxModel {
-    pub geometry: Handle<VoxGeometry>,
-    pub material: Handle<VoxMaterial>,
-    pub palette: Handle<VoxPalette>,
-    pub material_table: Handle<VoxMaterialTable>,
-    pub cull_min: UVec3,
-    pub cull_max: UVec3,
-}
-
 #[derive(Bundle, Default)]
 pub struct VoxInstanceBundle {
     pub transform: Transform,
@@ -260,14 +250,10 @@ pub struct VoxInstanceBundle {
 pub struct VoxPlugin;
 impl Plugin for VoxPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(PhysicsPlugins::default());
-
-        app.init_asset::<VoxGeometry>()
-            .init_asset::<VoxPalette>()
-            .init_asset::<VoxMaterialTable>()
-            .init_asset::<VoxMaterial>()
-            .register_type::<VoxInstance>()
-            .register_type::<VoxModel>();
+        app.init_asset::<DenseVoxelGeometry>()
+            .init_asset::<DenseVoxelMaterial>()
+            .register_type::<DenseVoxelModel>()
+            .register_type::<VoxInstance>();
 
         if app
             .world()
@@ -310,11 +296,8 @@ impl Plugin for VoxPlugin {
             Startup,
             (|allocator: Res<Allocator>,
               asset_server: Res<AssetServer>,
-              heap: Res<DescriptorHeap>| {
-                asset_server.register_loader(VoxLoader::new(
-                    allocator.clone(),
-                    heap.resource_heap().clone(),
-                ));
+              _heap: Res<DescriptorHeap>| {
+                asset_server.register_loader(VoxLoader::new(allocator.clone()));
             })
             .after(CreateDevice),
         );
@@ -323,41 +306,52 @@ impl Plugin for VoxPlugin {
 
 fn sync_buffers_system(
     mut ctx: SubmissionState,
-    mut material_events: MessageReader<AssetEvent<VoxMaterial>>,
-    mut palette_events: MessageReader<AssetEvent<VoxPalette>>,
-    mut material_table_events: MessageReader<AssetEvent<VoxMaterialTable>>,
-
-    materials: Res<Assets<VoxMaterial>>,
-    palettes: Res<Assets<VoxPalette>>,
-    material_tables: Res<Assets<VoxMaterialTable>>,
+    mut dense_geometry_events: MessageReader<AssetEvent<DenseVoxelGeometry>>,
+    mut dense_material_events: MessageReader<AssetEvent<DenseVoxelMaterial>>,
+    dense_geometries: Res<Assets<DenseVoxelGeometry>>,
+    dense_materials: Res<Assets<DenseVoxelMaterial>>,
 ) {
     ctx.record(|encoder| {
-        for event in material_events.read() {
+        for event in dense_geometry_events.read() {
             match event {
                 AssetEvent::Added { id } | AssetEvent::Modified { id } => {
-                    let material = materials.get(*id).unwrap();
-                    material.buffer.flush(encoder);
+                    let geometry = dense_geometries.get(*id).unwrap();
+                    geometry.flush(encoder);
                 }
                 _ => (),
             }
         }
-        for event in palette_events.read() {
+        for event in dense_material_events.read() {
             match event {
                 AssetEvent::Added { id } | AssetEvent::Modified { id } => {
-                    let palette = palettes.get(*id).unwrap();
-                    palette.flush(encoder);
-                }
-                _ => (),
-            }
-        }
-        for event in material_table_events.read() {
-            match event {
-                AssetEvent::Added { id } | AssetEvent::Modified { id } => {
-                    let material_table = material_tables.get(*id).unwrap();
-                    material_table.flush(encoder);
+                    let material = dense_materials.get(*id).unwrap();
+                    material.flush(encoder);
                 }
                 _ => (),
             }
         }
     });
+}
+
+#[derive(Resource)]
+pub struct BvhData {}
+
+fn sync_bvh_system(
+    mut ctx: SubmissionState,
+    mut collider_trees: ResMut<ColliderTrees>,
+    query: Query<&DenseVoxelModel>,
+    geometries: ResMut<Assets<DenseVoxelGeometry>>,
+    materials: ResMut<Assets<DenseVoxelMaterial>>,
+) {
+    let tree = collider_trees.tree_for_type_mut(ColliderTreeType::Static);
+    let bvh = &mut tree.bvh;
+    let cwbvh = bvh2_to_cwbvh(&bvh, 3, true, false);
+    let geometry_list = cwbvh.primitive_indices.iter().map(|index| {
+        let collider_entity = tree.proxies.get(*index as usize).unwrap().collider;
+        let model = query.get(collider_entity).unwrap();
+        let geometry = geometries.get(model.occupancy.id()).unwrap();
+        let material = materials.get(model.material.id()).unwrap();
+    });
+
+    ctx.record(|encoder| {});
 }

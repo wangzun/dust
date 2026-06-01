@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+avian3d.workspace = true
 bevy.workspace = true
 bevy_pumicite.workspace = true
 bytemuck = "1.23"
-dust_vox.workspace = true
+dust_dense.workspace = true
+obvhs.workspace = true
 pumicite.workspace = true

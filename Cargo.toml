@@ -9,20 +9,25 @@ members = ["crates/*"]
 [workspace.dependencies]
 dust_vdb = { path = "crates/vdb" }
 dust_vox = { path = "crates/vox" }
+dust_dense = { package = "dense", path = "crates/dense" }
 dust_pbr = { path = "crates/pbr" }
 dust_app = { path = "crates/app" }
 pumicite = { path = "../pumicite" }
 bevy_pumicite = { path = "../pumicite/crates/bevy" }
-avian3d = { version = "0.6", features = ["serialize"] }
+# avian3d = { version = "0.6", features = ["serialize"] }
+avian3d = { path = "../avian/crates/avian3d", features = ["serialize"] }
+obvhs = { version = "0.3" }
 
 [dependencies]
 dust_vox.workspace = true
 dust_pbr.workspace = true
 dust_app.workspace = true
+dust_dense.workspace = true
 bevy.workspace = true
 pumicite.workspace = true
 bevy_pumicite.workspace = true
 avian3d.workspace = true
+obvhs.workspace = true
 
 [build-dependencies]
 # spirv-builder = { path = "../rust-gpu/crates/spirv-builder" }
@@ -40,6 +45,7 @@ features = [
   "bevy_camera",
   "bevy_asset",
   "bevy_scene",
+  "bevy_picking",
   "free_camera",
   "debug",
   "reflect_auto_register",

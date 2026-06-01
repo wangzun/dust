@@ -8,3 +8,6 @@ pub mod mesh;
 pub mod mesh_render;
 #[cfg(feature = "post")]
 pub mod post;
+
+pub mod bvh;
+pub mod dense;

@@ -1,17 +1,21 @@
-use std::collections::HashMap;
-
-use bevy::asset::AssetId;
-use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState};
-use bevy::math::Affine3A;
+use avian3d::collider_tree::{ColliderTreeType, ColliderTrees};
+use avian3d::prelude::*;
+use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
+use bevy::picking::{
+    backend::ray::RayMap,
+    pointer::{PointerId, PointerInteraction},
+};
 use bevy::prelude::*;
 use bevy_pumicite::CreateDevice;
 use bevy_pumicite::PumiciteApp;
+use dust_dense::{DenseVoxelGeometry, DenseVoxelMaterial, DenseVoxelModel};
 use dust_pbr::camera::{Camera as SoftwareCamera, SoftwareVoxelCamera, SoftwareVoxelPixelArt};
-use dust_vox::{VoxGeometry, VoxModel};
+use obvhs::cwbvh::bvh2_to_cwbvh::bvh2_to_cwbvh;
 use pumicite::ash::vk;
 
 const TEAPOT_CENTER: Vec3 = Vec3::new(62.5, 30.0, 40.0);
 const TEAPOT_CAMERA_POSITION: Vec3 = Vec3::new(62.5, 35.0, 220.0);
+// const SCENE_PATH: &str = "teapot.vox";
 const SCENE_PATH: &str = "castle.vox";
 
 fn main() {
@@ -25,6 +29,8 @@ fn main() {
         .add_plugins(bevy_pumicite::swapchain::SwapchainPlugin);
 
     app.add_plugins(FreeCameraPlugin);
+    app.add_plugins(PhysicsPlugins::default());
+    app.add_plugins(PhysicsPickingPlugin);
 
     // Dust plugins
     app.add_plugins(dust_pbr::PbrRenderPlugin)
@@ -45,10 +51,7 @@ fn main() {
         });
 
     app.world_mut().spawn((
-        bevy::camera::Camera {
-            is_active: false,
-            ..default()
-        },
+        Camera3d::default(),
         SoftwareCamera {
             pixel_art: SoftwareVoxelPixelArt {
                 enabled: false,
@@ -69,6 +72,8 @@ fn main() {
     ));
 
     app.add_systems(Startup, startup_system.after(CreateDevice));
+    app.add_systems(Update, delete_voxel_by_hit);
+    app.add_systems(Update, get_collider_tree_bvh_to_raw_data);
     // app.add_systems(Update, frame_camera_to_loaded_scene);
 
     app.run();
@@ -76,141 +81,254 @@ fn main() {
 
 fn startup_system(mut commands: Commands, asset_server: Res<bevy::asset::AssetServer>) {
     let scene: Handle<Scene> = asset_server.load(SCENE_PATH);
-    // spawn 100 scene on a plane to test
-    for i in 0..100 {
-        commands.spawn((
-            SceneRoot(scene.clone()),
-            Transform::from_translation(Vec3::new(0.0, 0.0, -900.0 * i as f32)),
-        ));
-    }
-    // commands.spawn(SceneRoot(scene.clone()));
-    // commands.spawn((
-    //     SceneRoot(scene.clone()),
-    //     Transform::from_translation(Vec3::new(0.0, 0.0, -90.0)),
-    // ));
-    // commands.spawn((
-    //     SceneRoot(scene.clone()),
-    //     Transform::from_translation(Vec3::new(0.0, 0.0, -180.0)),
-    // ));
-    // commands.spawn((
-    //     SceneRoot(scene.clone()),
-    //     Transform::from_translation(Vec3::new(0.0, 0.0, -270.0)),
-    // ));
+    commands.spawn((SceneRoot(scene.clone()),));
 }
 
-fn frame_camera_to_loaded_scene(
-    mut framed: Local<bool>,
-    mut bounds_cache: Local<HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>>,
-    geometries: Res<Assets<VoxGeometry>>,
-    models: Query<
-        (&VoxModel, Option<&GlobalTransform>, Option<&Transform>),
-        Without<SoftwareVoxelCamera>,
-    >,
-    mut cameras: ParamSet<(
-        Query<(Entity, &SoftwareCamera, &mut Transform), With<SoftwareVoxelCamera>>,
-        Query<&mut FreeCameraState>,
-    )>,
+fn delete_voxel_by_hit(
+    buttons: Res<ButtonInput<MouseButton>>,
+    ray_map: Res<RayMap>,
+    pointers: Query<(&PointerId, &PointerInteraction)>,
+    parents: Query<&ChildOf>,
+    models: Query<(&DenseVoxelModel, &GlobalTransform)>,
+    mut colliders: Query<&mut Collider>,
+    mut dense_geometries: ResMut<Assets<DenseVoxelGeometry>>,
+    mut dense_materials: ResMut<Assets<DenseVoxelMaterial>>,
 ) {
-    if *framed {
+    if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
 
-    let Ok((camera_entity, tan_half_fov)) = cameras
-        .p0()
-        .single_mut()
-        .map(|(entity, camera, _)| (entity, camera.tan_half_fov()))
-    else {
-        return;
-    };
-    let mut pending_transform = None;
-
-    let mut scene_min = Vec3::splat(f32::INFINITY);
-    let mut scene_max = Vec3::splat(f32::NEG_INFINITY);
-    let mut saw_model = false;
-    let mut all_ready = true;
-
-    for (model, global_transform, local_transform) in models.iter() {
-        let Some(geometry) = geometries.get(&model.geometry) else {
-            all_ready = false;
+    for (pointer_id, interaction) in pointers.iter() {
+        let Some((hit_entity, hit)) = interaction.get_nearest_hit() else {
             continue;
         };
-        let Some((local_min, local_max)) =
-            geometry_bounds(&mut bounds_cache, model.geometry.id(), geometry)
+        println!("Hit entity {hit_entity:?} at {hit:?}");
+        let Some(ray) = ray_map
+            .iter()
+            .find(|(ray_id, _)| ray_id.camera == hit.camera && ray_id.pointer == *pointer_id)
+            .map(|(_, ray)| *ray)
         else {
             continue;
         };
 
-        let affine = global_transform
-            .map(GlobalTransform::affine)
-            .unwrap_or_else(|| {
-                local_transform
-                    .map(Transform::compute_affine)
-                    .unwrap_or(Affine3A::IDENTITY)
-            });
-        for corner in aabb_corners(
-            local_min * geometry.unit_size,
-            local_max * geometry.unit_size,
-        ) {
-            let point = affine.transform_point3(corner);
-            scene_min = scene_min.min(point);
-            scene_max = scene_max.max(point);
-        }
-        saw_model = true;
-    }
+        let Some((model_entity, model, transform)) =
+            find_dense_model_entity(*hit_entity, &models, &parents)
+        else {
+            continue;
+        };
 
-    if !all_ready || !saw_model {
+        let Some(geometry) = dense_geometries.get_mut(&model.occupancy) else {
+            continue;
+        };
+
+        let inverse = transform.affine().inverse();
+        let local_origin = inverse.transform_point3(ray.origin);
+        let local_dir = inverse.transform_vector3(*ray.direction);
+        let Some(coords) =
+            raycast_dense_voxels(local_origin, local_dir, hit.depth, geometry, model)
+        else {
+            continue;
+        };
+
+        let Some(material) = dense_materials.get_mut(&model.material) else {
+            continue;
+        };
+        println!(
+            "Clearing voxel at coords {:?} in model entity {model_entity:?}",
+            coords
+        );
+        DenseVoxelModel::clear_voxel(geometry, material, coords);
+
+        if let Ok(mut collider) = colliders.get_mut(model_entity) {
+            println!("Updating collider for model entity {model_entity:?}");
+            // *collider = Collider::voxels(Vec3::ONE, &dense_collider_voxels(geometry));
+        }
+
         return;
     }
-
-    let center = (scene_min + scene_max) * 0.5;
-    let radius = ((scene_max - scene_min).length() * 0.5).max(1.0);
-    let distance = radius / tan_half_fov.max(0.001) * 1.6;
-    let position = center + Vec3::new(0.0, radius * 0.25, distance);
-    let new_transform = Transform::from_translation(position).looking_at(center, Vec3::Y);
-
-    if let Ok((_, _, mut camera_transform)) = cameras.p0().get_mut(camera_entity) {
-        *camera_transform = new_transform;
-        pending_transform = Some(*camera_transform);
-    }
-
-    if let (Some(transform), Ok(mut free_camera_state)) =
-        (pending_transform, cameras.p1().get_mut(camera_entity))
-    {
-        let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
-        free_camera_state.yaw = yaw;
-        free_camera_state.pitch = pitch;
-        free_camera_state.velocity = Vec3::ZERO;
-    }
-
-    *framed = true;
 }
 
-fn geometry_bounds(
-    cache: &mut HashMap<AssetId<VoxGeometry>, Option<(Vec3, Vec3)>>,
-    id: AssetId<VoxGeometry>,
-    geometry: &VoxGeometry,
-) -> Option<(Vec3, Vec3)> {
-    *cache.entry(id).or_insert_with(|| {
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for coord in geometry.tree.iter() {
-            let p = coord.as_vec3();
-            min = min.min(p);
-            max = max.max(p + Vec3::ONE);
+fn find_dense_model_entity<'a>(
+    entity: Entity,
+    models: &'a Query<(&DenseVoxelModel, &GlobalTransform)>,
+    parents: &Query<&ChildOf>,
+) -> Option<(Entity, &'a DenseVoxelModel, &'a GlobalTransform)> {
+    let mut current = entity;
+    loop {
+        if let Ok((model, transform)) = models.get(current) {
+            return Some((current, model, transform));
         }
-        min.is_finite().then_some((min, max))
-    })
+        current = parents.get(current).ok()?.parent();
+    }
 }
 
-fn aabb_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
-    [
-        Vec3::new(min.x, min.y, min.z),
-        Vec3::new(max.x, min.y, min.z),
-        Vec3::new(min.x, max.y, min.z),
-        Vec3::new(max.x, max.y, min.z),
-        Vec3::new(min.x, min.y, max.z),
-        Vec3::new(max.x, min.y, max.z),
-        Vec3::new(min.x, max.y, max.z),
-        Vec3::new(max.x, max.y, max.z),
-    ]
+fn raycast_dense_voxels(
+    origin: Vec3,
+    dir: Vec3,
+    hit_t: f32,
+    geometry: &DenseVoxelGeometry,
+    model: &DenseVoxelModel,
+) -> Option<[u32; 3]> {
+    let dir_len = dir.length();
+    if dir_len <= f32::EPSILON {
+        return None;
+    }
+
+    let size = geometry.size();
+    let size = UVec3::new(size[0], size[1], size[2]);
+    let bounds_min = model.cull_min.min(size);
+    let bounds_max = model.cull_max.min(size);
+    if bounds_min.cmpge(bounds_max).any() {
+        return None;
+    }
+
+    let (enter_t, exit_t) =
+        intersect_bounds(origin, dir, bounds_min.as_vec3(), bounds_max.as_vec3())?;
+    let start_t = hit_t.max(enter_t);
+    if start_t > exit_t {
+        return None;
+    }
+    let bounds_min = bounds_min.as_ivec3();
+    let bounds_max = bounds_max.as_ivec3();
+    let start = origin + dir * (start_t + 0.001 / dir_len);
+    let mut voxel = start
+        .floor()
+        .as_ivec3()
+        .clamp(bounds_min, bounds_max - IVec3::ONE);
+    let step = IVec3::new(axis_step(dir.x), axis_step(dir.y), axis_step(dir.z));
+    let mut next_t = Vec3::new(
+        next_voxel_boundary_t(origin.x, dir.x, voxel.x, step.x),
+        next_voxel_boundary_t(origin.y, dir.y, voxel.y, step.y),
+        next_voxel_boundary_t(origin.z, dir.z, voxel.z, step.z),
+    );
+    let delta_t = Vec3::new(
+        voxel_axis_delta_t(dir.x),
+        voxel_axis_delta_t(dir.y),
+        voxel_axis_delta_t(dir.z),
+    );
+
+    while voxel.cmpge(bounds_min).all() && voxel.cmplt(bounds_max).all() {
+        let coords = [voxel.x as u32, voxel.y as u32, voxel.z as u32];
+        if geometry.is_occupied(coords) {
+            return Some(coords);
+        }
+
+        let axis_t = next_t.x.min(next_t.y).min(next_t.z);
+        if axis_t > exit_t {
+            break;
+        }
+
+        if next_t.x == axis_t {
+            voxel.x += step.x;
+            next_t.x += delta_t.x;
+        }
+        if next_t.y == axis_t {
+            voxel.y += step.y;
+            next_t.y += delta_t.y;
+        }
+        if next_t.z == axis_t {
+            voxel.z += step.z;
+            next_t.z += delta_t.z;
+        }
+    }
+
+    None
+}
+
+fn intersect_bounds(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)> {
+    let mut enter: f32 = 0.0;
+    let mut exit = f32::INFINITY;
+
+    for (origin, dir, min, max) in [
+        (origin.x, dir.x, min.x, max.x),
+        (origin.y, dir.y, min.y, max.y),
+        (origin.z, dir.z, min.z, max.z),
+    ] {
+        if dir.abs() <= f32::EPSILON {
+            if origin < min || origin > max {
+                return None;
+            }
+            continue;
+        }
+
+        let mut axis_enter = (min - origin) / dir;
+        let mut axis_exit = (max - origin) / dir;
+        if axis_enter > axis_exit {
+            std::mem::swap(&mut axis_enter, &mut axis_exit);
+        }
+        enter = enter.max(axis_enter);
+        exit = exit.min(axis_exit);
+        if enter > exit {
+            return None;
+        }
+    }
+
+    Some((enter, exit))
+}
+
+fn axis_step(dir: f32) -> i32 {
+    if dir > 0.0 {
+        1
+    } else if dir < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn next_voxel_boundary_t(origin: f32, dir: f32, voxel: i32, step: i32) -> f32 {
+    if step == 0 {
+        return f32::INFINITY;
+    }
+    let boundary = if step > 0 { voxel + 1 } else { voxel } as f32;
+    (boundary - origin) / dir
+}
+
+fn voxel_axis_delta_t(dir: f32) -> f32 {
+    if dir == 0.0 {
+        f32::INFINITY
+    } else {
+        1.0 / dir.abs()
+    }
+}
+
+fn dense_collider_voxels(geometry: &DenseVoxelGeometry) -> Vec<IVec3> {
+    let size = geometry.size();
+    let block_extent = dense_block_extent(size);
+    let mut voxels = Vec::new();
+    for (index, word) in geometry.occupancy().iter().copied().enumerate() {
+        let block = dense_block_coords(index as u32, block_extent);
+        let block_min = block * UVec3::splat(4);
+        let mut remaining = word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let local = UVec3::new(bit & 3, (bit >> 2) & 3, (bit >> 4) & 3);
+            let voxel = block_min + local;
+            if voxel.x < size[0] && voxel.y < size[1] && voxel.z < size[2] {
+                voxels.push(IVec3::new(voxel.x as i32, voxel.y as i32, voxel.z as i32));
+            }
+        }
+    }
+    voxels
+}
+
+fn dense_block_extent(size: [u32; 3]) -> UVec3 {
+    (UVec3::new(size[0], size[1], size[2]) + UVec3::splat(3)) / UVec3::splat(4)
+}
+
+fn dense_block_coords(index: u32, block_extent: UVec3) -> UVec3 {
+    let x = index % block_extent.x;
+    let yz = index / block_extent.x;
+    let y = yz % block_extent.y;
+    let z = yz / block_extent.y;
+    UVec3::new(x, y, z)
+}
+
+fn get_collider_tree_bvh_to_raw_data(mut collider_trees: ResMut<ColliderTrees>) {
+    let tree = collider_trees.tree_for_type_mut(ColliderTreeType::Static);
+    let bvh = &mut tree.bvh;
+    let cwbvh = bvh2_to_cwbvh(&bvh, 3, true, false);
+    let raw_data = cwbvh.primitive_indices;
+    // println!("Raw BVH data: {raw_data:?}");
 }

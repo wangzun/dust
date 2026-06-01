@@ -1,19 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::{asset::AssetLoader, math::Vec3A, prelude::*, reflect::TypePath};
-use bevy_pumicite::DescriptorHeap;
 use dot_vox::{DotVoxData, Rotation, SceneNode};
-use pumicite::bindless::ResourceHeap;
-use pumicite::{Allocator, ash::vk, buffer::ManagedBuffer};
-use rayon::prelude::*;
+use dust_dense::{DenseMaterialParam, DenseVoxelGeometry, DenseVoxelMaterial, DenseVoxelModel};
+use pumicite::{Allocator, ash::vk};
 use serde::{Deserialize, Serialize};
 
+// use avian3d::collision::collider::ColliderConstructor;
 use avian3d::prelude::*;
 
-use crate::{
-    VoxGeometry, VoxInstance, VoxInstanceBundle, VoxMaterial, VoxMaterialParam, VoxMaterialTable,
-    VoxModel, VoxPalette,
-};
+use crate::{VoxInstance, VoxInstanceBundle};
 
 enum WorldOrParent<'w, 'q> {
     World(&'w mut World),
@@ -134,21 +130,12 @@ impl<'a> SceneGraphTraverser<'a> {
                 if model.voxels.len() == 0 {
                     return;
                 }
-                // let mut grid_coordinates = vec![];
-                // for voxel in model.voxels.iter() {
-                //     let voxel = dot_vox::Voxel {
-                //         x: voxel.x,
-                //         y: voxel.z,
-                //         z: (model.size.y - voxel.y as u32 - 1) as u8,
-                //         i: voxel.i,
-                //     };
-                //     grid_coordinates.push(IVec3 {
-                //         x: voxel.x as i32,
-                //         y: voxel.y as i32,
-                //         z: voxel.z as i32,
-                //     });
-                // }
                 let size = self.scene.models[shape_model.model_id as usize].size;
+                println!(
+                    "Spawning model {} with size {:?}",
+                    shape_model.model_id, size
+                );
+                let dense_size = Vec3::new(size.x as f32, size.z as f32, size.y as f32);
                 let entity = parent
                     .spawn(VoxInstanceBundle {
                         transform: self.to_transform(
@@ -162,13 +149,18 @@ impl<'a> SceneGraphTraverser<'a> {
                         ),
                         ..Default::default()
                     })
-                    // .insert((
-                    //     ColliderConstructor::Voxels {
-                    //         voxel_size: Vec3::ONE,
-                    //         grid_coordinates,
-                    //     },
-                    //     RigidBody::Dynamic,
-                    // ))
+                    .insert((
+                        ColliderConstructor::compound(vec![(
+                            dense_size * 0.5,
+                            Quat::IDENTITY,
+                            ColliderConstructor::Cuboid {
+                                x_length: dense_size.x,
+                                y_length: dense_size.y,
+                                z_length: dense_size.z,
+                            },
+                        )]),
+                        RigidBody::Static,
+                    ))
                     .id();
                 self.instances.push((shape_model.model_id, entity));
                 self.models.insert(shape_model.model_id);
@@ -213,18 +205,16 @@ pub enum VoxLoadingError {
 #[derive(TypePath)]
 pub struct VoxLoader {
     allocator: Allocator,
-    heap: ResourceHeap,
 }
 impl VoxLoader {
-    pub fn new(allocator: Allocator, heap: ResourceHeap) -> Self {
-        Self { allocator, heap }
+    pub fn new(allocator: Allocator) -> Self {
+        Self { allocator }
     }
 }
 impl FromWorld for VoxLoader {
     fn from_world(world: &mut World) -> Self {
         Self {
             allocator: world.resource::<Allocator>().clone(),
-            heap: world.resource::<DescriptorHeap>().resource_heap().clone(),
         }
     }
 }
@@ -246,7 +236,7 @@ impl AssetLoader for VoxLoader {
     fn load(
         &self,
         reader: &mut dyn bevy::asset::io::Reader,
-        settings: &Self::Settings,
+        _settings: &Self::Settings,
         load_context: &mut bevy::asset::LoadContext,
     ) -> impl bevy::tasks::ConditionalSendFuture<Output = Result<Scene, VoxLoadingError>> {
         async {
@@ -280,43 +270,9 @@ impl AssetLoader for VoxLoader {
                 referenced_instances.len()
             );
 
-            let material_table_entries = material_table_entries(&file.palette, &file.materials);
-            let material_table_handle = load_context.add_labeled_asset("MaterialTable".into(), {
-                let mut material_table =
-                    VoxMaterialTable::from_entries(self.allocator.clone(), &material_table_entries)
-                        .map_err(VoxLoadingError::VulkanError)?;
-                material_table
-                    .register_bindless(&self.heap)
-                    .map_err(VoxLoadingError::VulkanError)?;
-                material_table
-            });
-
-            let palette_handle = load_context.add_labeled_asset("Palette".into(), {
-                let mut palette = VoxPalette::from_buffer(unsafe {
-                    let arr = std::mem::take(&mut file.palette).into_boxed_slice();
-                    assert_eq!(arr.len(), 256);
-                    let mut buffer = ManagedBuffer::new(
-                        self.allocator.clone(),
-                        256 * 4,
-                        4,
-                        vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .map_err(VoxLoadingError::VulkanError)?;
-                    buffer
-                        .as_slice_mut()
-                        .copy_from_slice(std::slice::from_raw_parts::<u8>(
-                            arr.as_ptr() as *const u8,
-                            256 * 4,
-                        ));
-                    buffer
-                });
-                palette
-                    .register_bindless(&self.heap)
-                    .map_err(VoxLoadingError::VulkanError)?;
-                palette
-            });
-
-            let model_handles: BTreeMap<u32, VoxModel> = {
+            let material_table_entries =
+                material_table_entries(&file.palette, &file.index_map, &file.materials);
+            let model_handles: BTreeMap<u32, DenseVoxelModel> = {
                 // Add models
                 let mut models: Vec<_> = std::mem::take(&mut file.models)
                     .into_iter()
@@ -332,38 +288,21 @@ impl AssetLoader for VoxLoader {
                     })
                     .collect::<Vec<_>>();
                 let handles = models
-                    .par_iter()
+                    .iter()
                     .map(|(model_id, model)| -> Result<_, VoxLoadingError> {
-                        let (mut tree, mut attribute_allocator) =
-                            self.model_to_tree(model, settings.unit_size);
-                        tree.register_bindless(&self.heap)
-                            .map_err(VoxLoadingError::VulkanError)?;
-                        attribute_allocator
-                            .register_bindless(&self.heap)
-                            .map_err(VoxLoadingError::VulkanError)?;
-                        Ok((*model_id, (tree, attribute_allocator)))
+                        Ok((
+                            *model_id,
+                            self.model_to_dense(model, &material_table_entries)?,
+                        ))
                     })
-                    .collect_vec_list();
-                let handles = handles
-                    .into_iter()
-                    .flat_map(|a| a)
                     .collect::<Result<Vec<_>, _>>()?;
-                BTreeMap::from_iter(handles.into_iter().map(|(model_id, (tree, material))| {
-                    let geometry =
-                        load_context.add_labeled_asset(format!("Geometry{}", model_id), tree);
-                    let material =
-                        load_context.add_labeled_asset(format!("Material{}", model_id), material);
-                    (
-                        model_id,
-                        VoxModel {
-                            geometry,
-                            material,
-                            palette: palette_handle.clone(),
-                            material_table: material_table_handle.clone(),
-                            cull_min: UVec3::ZERO,
-                            cull_max: UVec3::splat(256),
-                        },
-                    )
+                BTreeMap::from_iter(handles.into_iter().map(|(model_id, (geometry, material))| {
+                    let size = geometry.size();
+                    let geometry = load_context
+                        .add_labeled_asset(format!("DenseGeometry{}", model_id), geometry);
+                    let material = load_context
+                        .add_labeled_asset(format!("DenseMaterial{}", model_id), material);
+                    (model_id, DenseVoxelModel::new(geometry, material, size))
                 }))
             };
 
@@ -371,14 +310,7 @@ impl AssetLoader for VoxLoader {
                 let Some(model) = model_handles.get(&model_id) else {
                     continue;
                 };
-                world.entity_mut(entity).insert(VoxModel {
-                    geometry: model.geometry.clone(),
-                    material: model.material.clone(),
-                    palette: model.palette.clone(),
-                    material_table: model.material_table.clone(),
-                    cull_min: model.cull_min,
-                    cull_max: model.cull_max,
-                });
+                world.entity_mut(entity).insert(model.clone());
             }
 
             let scene = bevy::scene::Scene::new(world);
@@ -393,16 +325,17 @@ impl AssetLoader for VoxLoader {
     }
 }
 impl VoxLoader {
-    fn model_to_tree(&self, model: &dot_vox::Model, unit_size: f32) -> (VoxGeometry, VoxMaterial) {
-        let mut geometry = VoxGeometry::new(self.allocator.clone(), unit_size);
-        let mut material = VoxMaterial::new(self.allocator.clone());
-
-        // Create 256x256x256 grid
-        let mut accessor = geometry.tree.accessor_mut(&mut material);
+    fn model_to_dense(
+        &self,
+        model: &dot_vox::Model,
+        material_table_entries: &[DenseMaterialParam; 256],
+    ) -> Result<(DenseVoxelGeometry, DenseVoxelMaterial), VoxLoadingError> {
+        let size = [model.size.x, model.size.z, model.size.y];
+        let mut geometry = DenseVoxelGeometry::with_size(self.allocator.clone(), size)?;
+        let mut material = DenseVoxelMaterial::with_size(self.allocator.clone(), size)?;
+        material.set_material_params(material_table_entries);
         let size_y = model.size.y;
 
-        let mut min = UVec3::MAX;
-        let mut max = UVec3::MIN;
         for voxel in model.voxels.iter() {
             let voxel = dot_vox::Voxel {
                 x: voxel.x,
@@ -416,30 +349,32 @@ impl VoxLoader {
                 z: voxel.z as u32,
             };
 
-            accessor.set(coords, voxel.i + 1);
-            min = min.min(coords);
-            max = max.max(coords);
+            material.set_voxel(&mut geometry, coords.into(), voxel.i + 1);
         }
 
-        accessor.end();
-        // TODO: material.0.buffer_mut().flush(..);
-
-        (geometry, material)
+        Ok((geometry, material))
     }
 }
 
 fn material_table_entries(
     palette: &[dot_vox::Color],
+    index_map: &[u8],
     materials: &[dot_vox::Material],
-) -> [VoxMaterialParam; 256] {
-    let mut entries = [VoxMaterialParam::default(); 256];
-    for (index, entry) in entries.iter_mut().enumerate() {
-        if let Some(color) = palette.get(index) {
+) -> [DenseMaterialParam; 256] {
+    let mut entries = [DenseMaterialParam::default(); 256];
+    for material_id in 1..entries.len() {
+        let mapped_palette_id = index_map
+            .get(material_id - 1)
+            .copied()
+            .unwrap_or(material_id as u8);
+        let palette_index = mapped_palette_id.saturating_sub(1) as usize;
+        if let Some(color) = palette.get(palette_index) {
+            let entry = &mut entries[material_id];
             entry.base_color = [
                 color.r as f32 / 255.0,
                 color.g as f32 / 255.0,
                 color.b as f32 / 255.0,
-                1.0,
+                color.a as f32 / 255.0,
             ];
         }
     }
@@ -487,10 +422,6 @@ fn material_float(material: &dot_vox::Material, key: &str) -> Option<f32> {
 }
 
 fn material_table_index(material_id: u32) -> Option<usize> {
-    let index = if material_id == 0 {
-        0
-    } else {
-        material_id.checked_sub(1)? as usize
-    };
+    let index = material_id as usize;
     (index < 256).then_some(index)
 }
