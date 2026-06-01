@@ -14,8 +14,8 @@ dust_pbr = { path = "crates/pbr" }
 dust_app = { path = "crates/app" }
 pumicite = { path = "../pumicite" }
 bevy_pumicite = { path = "../pumicite/crates/bevy" }
-# avian3d = { version = "0.6", features = ["serialize"] }
-avian3d = { path = "../avian/crates/avian3d", features = ["serialize"] }
+avian3d = { version = "0.6", features = ["serialize"] }
+# avian3d = { path = "../avian/crates/avian3d", features = ["serialize"] }
 obvhs = { version = "0.3" }
 
 [dependencies]
